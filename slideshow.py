@@ -15,6 +15,7 @@ class InstantSlideshow:
         self.clock = pygame.time.Clock()
         self.running = True
         self.font = pygame.font.SysFont('Arial', 20)
+        self.last_switch_time = 0
         
         # Load paths
         self.load_paths()
@@ -23,6 +24,9 @@ class InstantSlideshow:
             print("No images found or file not provided.")
             pygame.quit()
             sys.exit()
+
+        # Ask for duration
+        self.get_slide_duration()
 
         # Shuffle paths
         print("Shuffling playlist...")
@@ -36,6 +40,19 @@ class InstantSlideshow:
         
         # Main Loop
         self.run()
+
+    def get_slide_duration(self):
+        print("Enter slide duration in seconds (default 30):")
+        try:
+            user_input = input("Duration: ").strip()
+            if not user_input:
+                self.slide_duration = 30000
+            else:
+                self.slide_duration = int(float(user_input) * 1000)
+        except ValueError:
+            print("Invalid input, using default 30 seconds.")
+            self.slide_duration = 30000
+        print(f"Slide duration set to {self.slide_duration/1000} seconds.")
 
     def load_paths(self):
         print("Please enter the path to the text file containing image paths:")
@@ -74,6 +91,7 @@ class InstantSlideshow:
         pygame.display.set_caption("Instant Slideshow")
 
     def load_current_image(self):
+        self.last_switch_time = pygame.time.get_ticks()
         if not self.image_paths:
             return
             
@@ -120,6 +138,10 @@ class InstantSlideshow:
 
     def run(self):
         while self.running:
+            # Auto advance
+            if pygame.time.get_ticks() - self.last_switch_time > self.slide_duration:
+                self.next_image()
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
