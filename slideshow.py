@@ -19,9 +19,10 @@ class POINT(ctypes.Structure):
 pygame.init()
 
 class InstantSlideshow:
-    def __init__(self, file_path=None, duration=None):
+    def __init__(self, file_path=None, duration=None, sort_order=None):
         self.file_path_arg = file_path
         self.duration_arg = duration
+        self.sort_order_arg = sort_order
         
         self.image_paths = []
         self.current_index = 0
@@ -103,9 +104,16 @@ class InstantSlideshow:
         # Ask for duration
         self.get_slide_duration()
 
-        # Shuffle paths
-        print(f"{Fore.MAGENTA}Shuffling playlist...")
-        random.shuffle(self.image_paths)
+        # Determine sort order
+        self.get_sort_order()
+
+        # Apply sort order
+        if self.sort_order == 'name':
+            print(f"{Fore.MAGENTA}Sorting playlist by name...")
+            self.image_paths.sort(key=lambda x: x.lower())
+        else:
+            print(f"{Fore.MAGENTA}Shuffling playlist...")
+            random.shuffle(self.image_paths)
         
         # Setup Window
         self.setup_window()
@@ -400,6 +408,27 @@ class InstantSlideshow:
         except Exception as e:
             print(f"Error opening folder: {e}")
 
+    def get_sort_order(self):
+        if self.sort_order_arg:
+            self.sort_order = self.sort_order_arg
+            print(f"{Fore.CYAN}Sort order set from arguments: {Style.BRIGHT}{self.sort_order}")
+            return
+
+        # If file path was provided via CLI but sort wasn't, use default automatically
+        if self.file_path_arg:
+            self.sort_order = 'random'
+            print(f"{Fore.CYAN}Using default sort order: {Style.BRIGHT}random")
+            return
+
+        print(f"{Fore.GREEN}Enter sort order (random/name) [default: random]:")
+        user_input = input(f"{Fore.YELLOW}Sort: {Style.RESET_ALL}").strip().lower()
+        
+        if user_input.startswith('n'):
+            self.sort_order = 'name'
+        else:
+            self.sort_order = 'random'
+        print(f"{Fore.CYAN}Sort order set to {Style.BRIGHT}{self.sort_order}")
+
     def run(self):
         while self.running:
             current_time = pygame.time.get_ticks()
@@ -543,7 +572,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Instant Slideshow from a text file of paths.")
     parser.add_argument("file", nargs="?", help="Path to the text file containing image paths")
     parser.add_argument("-d", "--duration", type=float, help="Slide duration in seconds")
+    parser.add_argument("-s", "--sort", choices=['random', 'name'], help="Sort order: random (default) or name")
     
     args = parser.parse_args()
     
-    InstantSlideshow(file_path=args.file, duration=args.duration)
+    InstantSlideshow(file_path=args.file, duration=args.duration, sort_order=args.sort)

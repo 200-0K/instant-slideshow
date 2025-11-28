@@ -43,6 +43,13 @@ Specify the slide duration in seconds using the `-d` flag.
 python slideshow.py "C:\path\to\list.txt" -d 5
 ```
 
+### 4. Sort Order
+Specify the sort order using the `-s` flag. Options: `random` (default), `name`.
+
+```bash
+python slideshow.py "C:\path\to\list.txt" -s name
+```
+
 ## Controls
 
 | Input | Action |
