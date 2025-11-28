@@ -122,6 +122,12 @@ class InstantSlideshow:
             print(f"{Fore.CYAN}Slide duration set from arguments: {Style.BRIGHT}{self.duration_arg}s")
             return
 
+        # If file path was provided via CLI but duration wasn't, use default automatically
+        if self.file_path_arg:
+            self.slide_duration = 30000
+            print(f"{Fore.CYAN}Using default slide duration: {Style.BRIGHT}30.0s")
+            return
+
         print(f"{Fore.GREEN}Enter slide duration in seconds (default 30):")
         try:
             user_input = input(f"{Fore.YELLOW}Duration: {Style.RESET_ALL}").strip()
