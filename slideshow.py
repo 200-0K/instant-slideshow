@@ -408,6 +408,20 @@ class InstantSlideshow:
         except Exception as e:
             print(f"Error opening folder: {e}")
 
+    def open_current_media(self):
+        if not self.image_paths: return
+        path = self.image_paths[self.current_index]
+        try:
+            if os.name == 'nt':
+                os.startfile(path)
+            else:
+                if sys.platform == 'darwin':
+                    subprocess.Popen(['open', path])
+                else:
+                    subprocess.Popen(['xdg-open', path])
+        except Exception as e:
+            print(f"Error opening media: {e}")
+
     def get_sort_order(self):
         if self.sort_order_arg:
             self.sort_order = self.sort_order_arg
@@ -453,11 +467,12 @@ class InstantSlideshow:
             # Define button areas
             close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
             folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
+            media_rect = pygame.Rect(folder_rect.left - spacing - btn_size, margin, btn_size, btn_size)
             
             # Duration Control Areas
             dur_btn_w = 20
             dur_text_w = 50
-            plus_rect = pygame.Rect(folder_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
+            plus_rect = pygame.Rect(media_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
             text_rect = pygame.Rect(plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
             minus_rect = pygame.Rect(text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
             dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
@@ -482,6 +497,8 @@ class InstantSlideshow:
                             self.running = False
                         elif folder_rect.collidepoint(event.pos):
                             self.open_current_folder()
+                        elif media_rect.collidepoint(event.pos):
+                            self.open_current_media()
                         elif plus_rect.collidepoint(event.pos):
                             self.slide_duration = min(self.slide_duration + 1000, 3600000)
                         elif minus_rect.collidepoint(event.pos):
@@ -572,6 +589,19 @@ class InstantSlideshow:
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 3, 9, 4))
             # Body
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 7, 20, 13))
+
+            # Media Button (Left of Folder)
+            is_media_hover = media_rect.collidepoint(mouse_pos)
+            media_color = (100, 255, 100) if is_media_hover else (180, 180, 180)
+            
+            # Draw Image Icon
+            # Frame
+            pygame.draw.rect(self.display_surface, media_color, (media_rect.left + 2, media_rect.top + 4, 20, 16), 2)
+            # Sun/Dot
+            pygame.draw.circle(self.display_surface, media_color, (media_rect.left + 8, media_rect.top + 9), 2)
+            # Mountain/Line
+            pygame.draw.line(self.display_surface, media_color, (media_rect.left + 4, media_rect.bottom - 6), (media_rect.left + 10, media_rect.bottom - 12), 2)
+            pygame.draw.line(self.display_surface, media_color, (media_rect.left + 10, media_rect.bottom - 12), (media_rect.right - 4, media_rect.bottom - 6), 2)
 
             # Duration Control
             is_minus_hover = minus_rect.collidepoint(mouse_pos)

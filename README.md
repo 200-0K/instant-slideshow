@@ -8,7 +8,7 @@ A lightweight, borderless image slideshow viewer written in Python using Pygame.
 *   **Format Support:** JPG, PNG, BMP, WEBP, and **Animated GIFs**.
 *   **Smart Rendering:** Borderless window, automatic scaling, and centering.
 *   **Font Support:** Handles filenames with CJK (Chinese/Japanese/Korean) characters and Emojis.
-*   **Modern UI:** Minimalist overlay with transparent title bar, close button, and "Open Folder" button.
+*   **Modern UI:** Minimalist overlay with transparent title bar, close button, "Open Folder", and "Open Media" buttons.
 *   **Controls:** Keyboard and Mouse navigation.
 
 ## Installation
@@ -66,5 +66,6 @@ python slideshow.py "C:\path\to\list.txt" -s name
 
 ## UI Buttons
 *   **Folder Icon:** Opens the file explorer to the current image's location.
+*   **Image Icon:** Opens the current image/media in the default system viewer.
 *   **X Icon:** Closes the application.
 *   **Duration Controls:** +/- buttons to adjust slide duration on the fly.
