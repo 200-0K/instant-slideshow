@@ -444,6 +444,24 @@ class InstantSlideshow:
                     self.current_image = self.scaled_gif_frames[self.current_gif_frame]
                     self.last_gif_update = current_time
 
+            # UI Layout Calculation
+            width = self.display_surface.get_width()
+            btn_size = 24
+            margin = 12
+            spacing = 10
+            
+            # Define button areas
+            close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
+            folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
+            
+            # Duration Control Areas
+            dur_btn_w = 20
+            dur_text_w = 50
+            plus_rect = pygame.Rect(folder_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
+            text_rect = pygame.Rect(plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
+            minus_rect = pygame.Rect(text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
+            dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
@@ -460,25 +478,20 @@ class InstantSlideshow:
                 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1: # Left Click
-                        # UI Constants
-                        btn_size = 24
-                        margin = 12
-                        spacing = 10
-                        width = self.display_surface.get_width()
-                        
-                        # Define button areas
-                        close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
-                        folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
-                        
                         if close_rect.collidepoint(event.pos):
                             self.running = False
                         elif folder_rect.collidepoint(event.pos):
                             self.open_current_folder()
+                        elif plus_rect.collidepoint(event.pos):
+                            self.slide_duration = min(self.slide_duration + 1000, 3600000)
+                        elif minus_rect.collidepoint(event.pos):
+                            self.slide_duration = max(self.slide_duration - 1000, 1000)
                         # Check if clicking in title bar area (top 50px)
                         elif event.pos[1] < 50:
-                            self.dragging = True
-                            self.drag_offset_x = event.pos[0]
-                            self.drag_offset_y = event.pos[1]
+                            if not dur_control_rect.collidepoint(event.pos): # Don't drag if clicking duration
+                                self.dragging = True
+                                self.drag_offset_x = event.pos[0]
+                                self.drag_offset_y = event.pos[1]
                         else:
                             self.prev_image()
                     elif event.button == 2: # Middle Click
@@ -486,9 +499,15 @@ class InstantSlideshow:
                     elif event.button == 3: # Right Click
                         self.next_image()
                     elif event.button == 4: # Scroll Up
-                        self.prev_image()
+                        if dur_control_rect.collidepoint(event.pos):
+                            self.slide_duration = min(self.slide_duration + 1000, 3600000)
+                        else:
+                            self.prev_image()
                     elif event.button == 5: # Scroll Down
-                        self.next_image()
+                        if dur_control_rect.collidepoint(event.pos):
+                            self.slide_duration = max(self.slide_duration - 1000, 1000)
+                        else:
+                            self.next_image()
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1:
@@ -499,8 +518,6 @@ class InstantSlideshow:
                         pt = POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
                         hwnd = pygame.display.get_wm_info()['window']
-                        # SetWindowPos(hwnd, hWndInsertAfter, X, Y, cx, cy, uFlags)
-                        # SWP_NOSIZE = 0x0001, SWP_NOZORDER = 0x0004
                         ctypes.windll.user32.SetWindowPos(hwnd, 0, pt.x - self.drag_offset_x, pt.y - self.drag_offset_y, 0, 0, 0x0001 | 0x0004)
                 
                 elif event.type == pygame.VIDEORESIZE:
@@ -536,13 +553,8 @@ class InstantSlideshow:
 
             # 3. Buttons
             mouse_pos = pygame.mouse.get_pos()
-            btn_size = 24
-            margin = 12
-            spacing = 10
-            width = self.display_surface.get_width()
             
             # Close Button (Rightmost)
-            close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
             is_close_hover = close_rect.collidepoint(mouse_pos)
             close_color = (255, 80, 80) if is_close_hover else (180, 180, 180)
             
@@ -552,7 +564,6 @@ class InstantSlideshow:
             pygame.draw.line(self.display_surface, close_color, (close_rect.left + p, close_rect.bottom - p), (close_rect.right - p, close_rect.top + p), 2)
 
             # Folder Button (Left of Close)
-            folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
             is_folder_hover = folder_rect.collidepoint(mouse_pos)
             folder_color = (100, 200, 255) if is_folder_hover else (180, 180, 180)
             
@@ -561,6 +572,34 @@ class InstantSlideshow:
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 3, 9, 4))
             # Body
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 7, 20, 13))
+
+            # Duration Control
+            is_minus_hover = minus_rect.collidepoint(mouse_pos)
+            is_plus_hover = plus_rect.collidepoint(mouse_pos)
+            is_text_hover = text_rect.collidepoint(mouse_pos)
+            
+            dur_color = (255, 255, 255) if is_text_hover else (180, 180, 180)
+            btn_color_hover = (255, 255, 255)
+            btn_color_normal = (150, 150, 150)
+            
+            # Draw Minus
+            minus_color = btn_color_hover if is_minus_hover else btn_color_normal
+            pygame.draw.line(self.display_surface, minus_color, (minus_rect.left + 5, minus_rect.centery), (minus_rect.right - 5, minus_rect.centery), 2)
+            
+            # Draw Plus
+            plus_color = btn_color_hover if is_plus_hover else btn_color_normal
+            pygame.draw.line(self.display_surface, plus_color, (plus_rect.left + 5, plus_rect.centery), (plus_rect.right - 5, plus_rect.centery), 2)
+            pygame.draw.line(self.display_surface, plus_color, (plus_rect.centerx, plus_rect.top + 5), (plus_rect.centerx, plus_rect.bottom - 5), 2)
+            
+            # Draw Text
+            dur_str = f"{self.slide_duration/1000:.1f}s"
+            font = self.font_local if self.font_local else self.font_cjk
+            try:
+                text_surf = font.render(dur_str, True, dur_color)
+                text_rect_center = text_surf.get_rect(center=text_rect.center)
+                self.display_surface.blit(text_surf, text_rect_center)
+            except:
+                pass
 
             pygame.display.flip()
             self.clock.tick(30)

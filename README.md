@@ -61,9 +61,10 @@ python slideshow.py "C:\path\to\list.txt" -s name
 | **Left Click** | Previous Image (or interact with UI) |
 | **Right Click** | Next Image |
 | **Middle Click** | Pause / Resume |
-| **Scroll Wheel** | Navigate Previous / Next |
+| **Scroll Wheel** | Navigate Previous / Next (Adjust duration when hovering over timer) |
 | **Drag Top** | Move Window |
 
 ## UI Buttons
 *   **Folder Icon:** Opens the file explorer to the current image's location.
 *   **X Icon:** Closes the application.
+*   **Duration Controls:** +/- buttons to adjust slide duration on the fly.
