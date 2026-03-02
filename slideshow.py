@@ -8,6 +8,8 @@ from PIL import Image
 import argparse
 from colorama import init, Fore, Style
 
+STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_selected_list.txt')
+
 # Initialize Colorama
 init(autoreset=True)
 
@@ -82,8 +84,12 @@ class InstantSlideshow:
         self.paused = False
         self.pause_start_time = 0
         self.dragging = False
+        self.pending_drag = False
         self.drag_offset_x = 0
         self.drag_offset_y = 0
+        self.drag_start_pos = (0, 0)
+        self.drag_threshold = 6
+        self.pressed_control = None
         
         # GIF support variables
         self.is_gif = False
@@ -165,6 +171,9 @@ class InstantSlideshow:
                 input("Press Enter to exit...")
             sys.exit()
 
+        file_path = os.path.abspath(file_path)
+        self.save_last_selected_file(file_path)
+
         print(f"{Fore.CYAN}Reading paths from file...")
         
         # Try multiple encodings to handle special characters/box chars
@@ -191,6 +200,14 @@ class InstantSlideshow:
         
         self.image_paths = [p for p in all_lines if p.lower().endswith(valid_extensions)]
         print(f"{Fore.GREEN}Loaded {Style.BRIGHT}{len(self.image_paths)}{Style.NORMAL}{Fore.GREEN} valid images from {len(all_lines)} lines.")
+
+    def save_last_selected_file(self, file_path):
+        try:
+            with open(STATE_FILE, 'w', encoding='utf-8') as f:
+                f.write(file_path)
+            print(f"{Fore.CYAN}Saved last list file: {Style.BRIGHT}{file_path}")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: Could not save last list file: {e}")
 
     def setup_window(self):
         # Center the window
@@ -460,6 +477,7 @@ class InstantSlideshow:
 
             # UI Layout Calculation
             width = self.display_surface.get_width()
+            header_h = 50
             btn_size = 24
             margin = 12
             spacing = 10
@@ -477,6 +495,14 @@ class InstantSlideshow:
             minus_rect = pygame.Rect(text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
             dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
 
+            hit_padding = 8
+            close_hit_rect = close_rect.inflate(hit_padding, hit_padding)
+            folder_hit_rect = folder_rect.inflate(hit_padding, hit_padding)
+            media_hit_rect = media_rect.inflate(hit_padding, hit_padding)
+            plus_hit_rect = plus_rect.inflate(hit_padding, hit_padding)
+            minus_hit_rect = minus_rect.inflate(hit_padding, hit_padding)
+            dur_control_hit_rect = dur_control_rect.inflate(hit_padding, hit_padding)
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     self.running = False
@@ -493,20 +519,25 @@ class InstantSlideshow:
                 
                 elif event.type == pygame.MOUSEBUTTONDOWN:
                     if event.button == 1: # Left Click
-                        if close_rect.collidepoint(event.pos):
-                            self.running = False
-                        elif folder_rect.collidepoint(event.pos):
-                            self.open_current_folder()
-                        elif media_rect.collidepoint(event.pos):
-                            self.open_current_media()
-                        elif plus_rect.collidepoint(event.pos):
-                            self.slide_duration = min(self.slide_duration + 1000, 3600000)
-                        elif minus_rect.collidepoint(event.pos):
-                            self.slide_duration = max(self.slide_duration - 1000, 1000)
+                        self.pressed_control = None
+                        self.dragging = False
+                        self.pending_drag = False
+
+                        if close_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'close'
+                        elif folder_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'folder'
+                        elif media_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'media'
+                        elif plus_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'plus'
+                        elif minus_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'minus'
                         # Check if clicking in title bar area (top 50px)
-                        elif event.pos[1] < 50:
-                            if not dur_control_rect.collidepoint(event.pos): # Don't drag if clicking duration
-                                self.dragging = True
+                        elif event.pos[1] < header_h:
+                            if not dur_control_hit_rect.collidepoint(event.pos): # Don't drag if clicking duration
+                                self.pending_drag = True
+                                self.drag_start_pos = event.pos
                                 self.drag_offset_x = event.pos[0]
                                 self.drag_offset_y = event.pos[1]
                         else:
@@ -528,9 +559,29 @@ class InstantSlideshow:
 
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1:
+                        if self.pressed_control and not self.dragging:
+                            if self.pressed_control == 'close' and close_hit_rect.collidepoint(event.pos):
+                                self.running = False
+                            elif self.pressed_control == 'folder' and folder_hit_rect.collidepoint(event.pos):
+                                self.open_current_folder()
+                            elif self.pressed_control == 'media' and media_hit_rect.collidepoint(event.pos):
+                                self.open_current_media()
+                            elif self.pressed_control == 'plus' and plus_hit_rect.collidepoint(event.pos):
+                                self.slide_duration = min(self.slide_duration + 1000, 3600000)
+                            elif self.pressed_control == 'minus' and minus_hit_rect.collidepoint(event.pos):
+                                self.slide_duration = max(self.slide_duration - 1000, 1000)
+
+                        self.pressed_control = None
+                        self.pending_drag = False
                         self.dragging = False
 
                 elif event.type == pygame.MOUSEMOTION:
+                    if self.pending_drag and not self.dragging:
+                        dx = abs(event.pos[0] - self.drag_start_pos[0])
+                        dy = abs(event.pos[1] - self.drag_start_pos[1])
+                        if dx >= self.drag_threshold or dy >= self.drag_threshold:
+                            self.dragging = True
+
                     if self.dragging:
                         pt = POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
@@ -555,7 +606,6 @@ class InstantSlideshow:
             # --- Draw Modern UI Overlay ---
             
             # 1. Header Background (Semi-transparent black)
-            header_h = 50
             header_surf = pygame.Surface((self.display_surface.get_width(), header_h), pygame.SRCALPHA)
             header_surf.fill((0, 0, 0, 180)) # Dark semi-transparent background
             self.display_surface.blit(header_surf, (0, 0))
@@ -572,7 +622,7 @@ class InstantSlideshow:
             mouse_pos = pygame.mouse.get_pos()
             
             # Close Button (Rightmost)
-            is_close_hover = close_rect.collidepoint(mouse_pos)
+            is_close_hover = close_hit_rect.collidepoint(mouse_pos)
             close_color = (255, 80, 80) if is_close_hover else (180, 180, 180)
             
             # Draw X (Cleaner, thinner)
@@ -581,7 +631,7 @@ class InstantSlideshow:
             pygame.draw.line(self.display_surface, close_color, (close_rect.left + p, close_rect.bottom - p), (close_rect.right - p, close_rect.top + p), 2)
 
             # Folder Button (Left of Close)
-            is_folder_hover = folder_rect.collidepoint(mouse_pos)
+            is_folder_hover = folder_hit_rect.collidepoint(mouse_pos)
             folder_color = (100, 200, 255) if is_folder_hover else (180, 180, 180)
             
             # Draw Folder Icon (Filled style)
@@ -591,7 +641,7 @@ class InstantSlideshow:
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 7, 20, 13))
 
             # Media Button (Left of Folder)
-            is_media_hover = media_rect.collidepoint(mouse_pos)
+            is_media_hover = media_hit_rect.collidepoint(mouse_pos)
             media_color = (100, 255, 100) if is_media_hover else (180, 180, 180)
             
             # Draw Image Icon
@@ -604,9 +654,9 @@ class InstantSlideshow:
             pygame.draw.line(self.display_surface, media_color, (media_rect.left + 10, media_rect.bottom - 12), (media_rect.right - 4, media_rect.bottom - 6), 2)
 
             # Duration Control
-            is_minus_hover = minus_rect.collidepoint(mouse_pos)
-            is_plus_hover = plus_rect.collidepoint(mouse_pos)
-            is_text_hover = text_rect.collidepoint(mouse_pos)
+            is_minus_hover = minus_hit_rect.collidepoint(mouse_pos)
+            is_plus_hover = plus_hit_rect.collidepoint(mouse_pos)
+            is_text_hover = dur_control_hit_rect.collidepoint(mouse_pos)
             
             dur_color = (255, 255, 255) if is_text_hover else (180, 180, 180)
             btn_color_hover = (255, 255, 255)
