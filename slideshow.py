@@ -1,23 +1,109 @@
 import pygame
 import sys
 import os
+import json
 import random
 import ctypes
 import subprocess
+from datetime import datetime
 from PIL import Image
 import argparse
 from colorama import init, Fore, Style
+from send2trash import send2trash
 
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'last_selected_list.txt')
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+STATE_FILE = os.path.join(SCRIPT_DIR, 'last_selected_list.txt')
+RECENTS_FILE = os.path.join(SCRIPT_DIR, 'recents.json')
+MAX_RECENTS = 50
 
-# Initialize Colorama
+
+def load_recents():
+    """Load recents list, migrating the legacy STATE_FILE on first run."""
+    if not os.path.exists(RECENTS_FILE) and os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, 'r', encoding='utf-8') as f:
+                legacy_path = f.read().strip()
+            if legacy_path:
+                entry = {
+                    'path': legacy_path,
+                    'last_used': datetime.now().isoformat(timespec='seconds'),
+                    'duration': 30,
+                    'sort': 'random',
+                }
+                save_recents([entry])
+                print(f"{Fore.CYAN}Migrated legacy state file to recents.json")
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: could not migrate legacy state file: {e}")
+        try:
+            os.remove(STATE_FILE)
+        except Exception:
+            pass
+
+    if not os.path.exists(RECENTS_FILE):
+        return []
+
+    try:
+        with open(RECENTS_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if isinstance(data, list):
+            cleaned = []
+            for item in data:
+                if isinstance(item, dict) and 'path' in item:
+                    cleaned.append({
+                        'path': item['path'],
+                        'last_used': item.get('last_used', ''),
+                        'duration': int(item.get('duration', 30)),
+                        'sort': item.get('sort', 'random'),
+                    })
+            return cleaned
+    except Exception as e:
+        print(f"{Fore.YELLOW}Warning: could not read recents.json: {e}")
+    return []
+
+
+def save_recents(recents):
+    try:
+        with open(RECENTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(recents[:MAX_RECENTS], f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"{Fore.YELLOW}Warning: could not save recents.json: {e}")
+
+
+def draw_close_x(surface, rect, color, pad=6, width=2):
+    pygame.draw.line(surface, color, (rect.left + pad, rect.top + pad), (rect.right - pad, rect.bottom - pad), width)
+    pygame.draw.line(surface, color, (rect.left + pad, rect.bottom - pad), (rect.right - pad, rect.top + pad), width)
+
+
+def load_local_font(size):
+    path = os.path.join(SCRIPT_DIR, 'fonts', 'Noto_Sans', 'NotoSans-Regular.ttf')
+    if os.path.exists(path):
+        try:
+            return pygame.font.Font(path, size)
+        except Exception as e:
+            print(f"Failed to load local font: {e}")
+    return None
+
+
+def add_recent(path, duration, sort_order):
+    """Add or update a recent entry, moving it to the top."""
+    path = os.path.abspath(path)
+    recents = load_recents()
+    recents = [r for r in recents if os.path.abspath(r['path']) != path]
+    recents.insert(0, {
+        'path': path,
+        'last_used': datetime.now().isoformat(timespec='seconds'),
+        'duration': int(duration),
+        'sort': sort_order,
+    })
+    save_recents(recents)
+
 init(autoreset=True)
 
-# Structure for GetCursorPos
+
 class POINT(ctypes.Structure):
     _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
 
-# Initialize Pygame
+
 pygame.init()
 
 class InstantSlideshow:
@@ -66,15 +152,7 @@ class InstantSlideshow:
         self.font_cjk = get_font(cjk_priority)
         self.font_emoji = get_font(['segoe ui emoji', 'segoeuiemoji', 'apple color emoji'])
         
-        # Try to load local font (Noto Sans) for Latin characters
-        self.font_local = None
-        local_font_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'fonts', 'Noto_Sans', 'NotoSans-Regular.ttf')
-        if os.path.exists(local_font_path):
-            try:
-                print(f"Loading local font: {local_font_path}")
-                self.font_local = pygame.font.Font(local_font_path, 16)
-            except Exception as e:
-                print(f"Failed to load local font: {e}")
+        self.font_local = load_local_font(16)
         
         self.current_font = self.font_cjk
         
@@ -90,44 +168,37 @@ class InstantSlideshow:
         self.drag_start_pos = (0, 0)
         self.drag_threshold = 6
         self.pressed_control = None
-        
-        # GIF support variables
+        self.next_action = 'exit'  # set to 'picker' to return to the picker on exit
+
         self.is_gif = False
-        self.gif_frames = [] # List of PIL images
-        self.scaled_gif_frames = [] # List of Pygame surfaces
+        self.gif_frames = []
+        self.scaled_gif_frames = []
         self.gif_durations = []
         self.current_gif_frame = 0
         self.last_gif_update = 0
 
-        # Load paths
         self.load_paths()
-        
+
         if not self.image_paths:
             print(f"{Fore.RED}No images found or file not provided.")
             pygame.quit()
             sys.exit()
 
-        # Ask for duration
         self.get_slide_duration()
-
-        # Determine sort order
         self.get_sort_order()
 
-        # Apply sort order
+        if hasattr(self, 'selected_file_path'):
+            add_recent(self.selected_file_path, self.slide_duration / 1000, self.sort_order)
+
         if self.sort_order == 'name':
             print(f"{Fore.MAGENTA}Sorting playlist by name...")
             self.image_paths.sort(key=lambda x: x.lower())
         else:
             print(f"{Fore.MAGENTA}Shuffling playlist...")
             random.shuffle(self.image_paths)
-        
-        # Setup Window
+
         self.setup_window()
-        
-        # Load first image
         self.load_current_image()
-        
-        # Main Loop
         self.run()
 
     def get_slide_duration(self):
@@ -172,7 +243,7 @@ class InstantSlideshow:
             sys.exit()
 
         file_path = os.path.abspath(file_path)
-        self.save_last_selected_file(file_path)
+        self.selected_file_path = file_path
 
         print(f"{Fore.CYAN}Reading paths from file...")
         
@@ -201,18 +272,14 @@ class InstantSlideshow:
         self.image_paths = [p for p in all_lines if p.lower().endswith(valid_extensions)]
         print(f"{Fore.GREEN}Loaded {Style.BRIGHT}{len(self.image_paths)}{Style.NORMAL}{Fore.GREEN} valid images from {len(all_lines)} lines.")
 
-    def save_last_selected_file(self, file_path):
-        try:
-            with open(STATE_FILE, 'w', encoding='utf-8') as f:
-                f.write(file_path)
-            print(f"{Fore.CYAN}Saved last list file: {Style.BRIGHT}{file_path}")
-        except Exception as e:
-            print(f"{Fore.YELLOW}Warning: Could not save last list file: {e}")
-
     def setup_window(self):
-        # Center the window
         os.environ['SDL_VIDEO_CENTERED'] = '1'
-        
+
+        # Reinit display so Info() reports the monitor size, not a prior
+        # window's size (e.g. the 420x400 picker).
+        pygame.display.quit()
+        pygame.display.init()
+
         info = pygame.display.Info()
         screen_width = info.current_w
         screen_height = info.current_h
@@ -439,6 +506,28 @@ class InstantSlideshow:
         except Exception as e:
             print(f"Error opening media: {e}")
 
+    def delete_current_image(self):
+        if not self.image_paths:
+            return
+        path = self.image_paths[self.current_index]
+        try:
+            send2trash(os.path.normpath(path))
+            print(f"{Fore.YELLOW}Moved to Recycle Bin: {Style.BRIGHT}{path}")
+        except Exception as e:
+            print(f"{Fore.RED}Error deleting {path}: {e}")
+            return
+
+        del self.image_paths[self.current_index]
+
+        if not self.image_paths:
+            print(f"{Fore.YELLOW}Playlist is empty. Exiting.")
+            self.running = False
+            return
+
+        if self.current_index >= len(self.image_paths):
+            self.current_index = 0
+        self.load_current_image()
+
     def get_sort_order(self):
         if self.sort_order_arg:
             self.sort_order = self.sort_order_arg
@@ -461,47 +550,49 @@ class InstantSlideshow:
         print(f"{Fore.CYAN}Sort order set to {Style.BRIGHT}{self.sort_order}")
 
     def run(self):
+        width = self.display_surface.get_width()
+        header_h = 50
+        btn_size = 24
+        margin = 12
+        spacing = 10
+
+        # Button areas (right-to-left): [close] [folder] [media] [trash] [back] [+ dur -]
+        close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
+        folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
+        media_rect = pygame.Rect(folder_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+        trash_rect = pygame.Rect(media_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+        back_rect = pygame.Rect(trash_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+
+        dur_btn_w = 20
+        dur_text_w = 50
+        plus_rect = pygame.Rect(back_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
+        dur_text_rect = pygame.Rect(plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
+        minus_rect = pygame.Rect(dur_text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
+        dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
+
+        hit_padding = 12
+        close_hit_rect = close_rect.inflate(hit_padding, hit_padding)
+        folder_hit_rect = folder_rect.inflate(hit_padding, hit_padding)
+        media_hit_rect = media_rect.inflate(hit_padding, hit_padding)
+        trash_hit_rect = trash_rect.inflate(hit_padding, hit_padding)
+        back_hit_rect = back_rect.inflate(hit_padding, hit_padding)
+        plus_hit_rect = plus_rect.inflate(hit_padding, hit_padding)
+        minus_hit_rect = minus_rect.inflate(hit_padding, hit_padding)
+        dur_control_hit_rect = dur_control_rect.inflate(hit_padding, hit_padding)
+
+        dur_font = self.font_local if self.font_local else self.font_cjk
+
         while self.running:
             current_time = pygame.time.get_ticks()
-            
-            # Auto advance slide
+
             if not self.paused and current_time - self.last_switch_time > self.slide_duration:
                 self.next_image()
 
-            # Update GIF frame
             if not self.paused and self.is_gif and self.scaled_gif_frames:
                 if current_time - self.last_gif_update > self.gif_durations[self.current_gif_frame]:
                     self.current_gif_frame = (self.current_gif_frame + 1) % len(self.scaled_gif_frames)
                     self.current_image = self.scaled_gif_frames[self.current_gif_frame]
                     self.last_gif_update = current_time
-
-            # UI Layout Calculation
-            width = self.display_surface.get_width()
-            header_h = 50
-            btn_size = 24
-            margin = 12
-            spacing = 10
-            
-            # Define button areas
-            close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
-            folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
-            media_rect = pygame.Rect(folder_rect.left - spacing - btn_size, margin, btn_size, btn_size)
-            
-            # Duration Control Areas
-            dur_btn_w = 20
-            dur_text_w = 50
-            plus_rect = pygame.Rect(media_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
-            text_rect = pygame.Rect(plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
-            minus_rect = pygame.Rect(text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
-            dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
-
-            hit_padding = 8
-            close_hit_rect = close_rect.inflate(hit_padding, hit_padding)
-            folder_hit_rect = folder_rect.inflate(hit_padding, hit_padding)
-            media_hit_rect = media_rect.inflate(hit_padding, hit_padding)
-            plus_hit_rect = plus_rect.inflate(hit_padding, hit_padding)
-            minus_hit_rect = minus_rect.inflate(hit_padding, hit_padding)
-            dur_control_hit_rect = dur_control_rect.inflate(hit_padding, hit_padding)
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -529,6 +620,10 @@ class InstantSlideshow:
                             self.pressed_control = 'folder'
                         elif media_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'media'
+                        elif trash_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'trash'
+                        elif back_hit_rect.collidepoint(event.pos):
+                            self.pressed_control = 'back'
                         elif plus_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'plus'
                         elif minus_hit_rect.collidepoint(event.pos):
@@ -566,6 +661,11 @@ class InstantSlideshow:
                                 self.open_current_folder()
                             elif self.pressed_control == 'media' and media_hit_rect.collidepoint(event.pos):
                                 self.open_current_media()
+                            elif self.pressed_control == 'trash' and trash_hit_rect.collidepoint(event.pos):
+                                self.delete_current_image()
+                            elif self.pressed_control == 'back' and back_hit_rect.collidepoint(event.pos):
+                                self.next_action = 'picker'
+                                self.running = False
                             elif self.pressed_control == 'plus' and plus_hit_rect.collidepoint(event.pos):
                                 self.slide_duration = min(self.slide_duration + 1000, 3600000)
                             elif self.pressed_control == 'minus' and minus_hit_rect.collidepoint(event.pos):
@@ -582,117 +682,487 @@ class InstantSlideshow:
                         if dx >= self.drag_threshold or dy >= self.drag_threshold:
                             self.dragging = True
 
-                    if self.dragging:
+                    if self.dragging and os.name == 'nt':
                         pt = POINT()
                         ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
                         hwnd = pygame.display.get_wm_info()['window']
                         ctypes.windll.user32.SetWindowPos(hwnd, 0, pt.x - self.drag_offset_x, pt.y - self.drag_offset_y, 0, 0, 0x0001 | 0x0004)
-                
-                elif event.type == pygame.VIDEORESIZE:
-                    self.display_surface = pygame.display.set_mode((event.w, event.h), pygame.RESIZABLE)
-                    self.rescale_image()
 
-            # Draw
             self.display_surface.fill((0, 0, 0))
-            
+
             if self.current_image:
                 self.display_surface.blit(self.current_image, (self.img_x, self.img_y))
             else:
-                # Draw error text if image failed
-                text = self.font_cjk.render("Could not load image", True, (255, 255, 255))
-                text_rect = text.get_rect(center=(self.width//2, self.height//2))
-                self.display_surface.blit(text, text_rect)
+                err_surf = self.font_cjk.render("Could not load image", True, (255, 255, 255))
+                self.display_surface.blit(err_surf, err_surf.get_rect(center=(self.width // 2, self.height // 2)))
 
-            # --- Draw Modern UI Overlay ---
-            
-            # 1. Header Background (Semi-transparent black)
             header_surf = pygame.Surface((self.display_surface.get_width(), header_h), pygame.SRCALPHA)
-            header_surf.fill((0, 0, 0, 180)) # Dark semi-transparent background
+            header_surf.fill((0, 0, 0, 180))
             self.display_surface.blit(header_surf, (0, 0))
 
-            # 2. Title Text
             if hasattr(self, 'caption_text'):
                 display_text = self.caption_text
                 if self.paused:
                     display_text += " [PAUSED]"
-                # Vertically center text in header (approx y=15 for 16px font in 50px header)
                 self.draw_text_mixed(self.display_surface, display_text, (15, 15), (0, 255, 0))
 
-            # 3. Buttons
             mouse_pos = pygame.mouse.get_pos()
-            
-            # Close Button (Rightmost)
-            is_close_hover = close_hit_rect.collidepoint(mouse_pos)
-            close_color = (255, 80, 80) if is_close_hover else (180, 180, 180)
-            
-            # Draw X (Cleaner, thinner)
-            p = 6
-            pygame.draw.line(self.display_surface, close_color, (close_rect.left + p, close_rect.top + p), (close_rect.right - p, close_rect.bottom - p), 2)
-            pygame.draw.line(self.display_surface, close_color, (close_rect.left + p, close_rect.bottom - p), (close_rect.right - p, close_rect.top + p), 2)
 
-            # Folder Button (Left of Close)
-            is_folder_hover = folder_hit_rect.collidepoint(mouse_pos)
-            folder_color = (100, 200, 255) if is_folder_hover else (180, 180, 180)
-            
-            # Draw Folder Icon (Filled style)
-            # Tab
+            close_color = (255, 80, 80) if close_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+            draw_close_x(self.display_surface, close_rect, close_color)
+
+            folder_color = (100, 200, 255) if folder_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 3, 9, 4))
-            # Body
             pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 7, 20, 13))
 
-            # Media Button (Left of Folder)
-            is_media_hover = media_hit_rect.collidepoint(mouse_pos)
-            media_color = (100, 255, 100) if is_media_hover else (180, 180, 180)
-            
-            # Draw Image Icon
-            # Frame
+            media_color = (100, 255, 100) if media_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
             pygame.draw.rect(self.display_surface, media_color, (media_rect.left + 2, media_rect.top + 4, 20, 16), 2)
-            # Sun/Dot
             pygame.draw.circle(self.display_surface, media_color, (media_rect.left + 8, media_rect.top + 9), 2)
-            # Mountain/Line
             pygame.draw.line(self.display_surface, media_color, (media_rect.left + 4, media_rect.bottom - 6), (media_rect.left + 10, media_rect.bottom - 12), 2)
             pygame.draw.line(self.display_surface, media_color, (media_rect.left + 10, media_rect.bottom - 12), (media_rect.right - 4, media_rect.bottom - 6), 2)
 
-            # Duration Control
+            back_color = (255, 200, 100) if back_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+            bl, bt = back_rect.left, back_rect.top
+            pygame.draw.polygon(self.display_surface, back_color, [
+                (back_rect.centerx, bt + 3),
+                (bl + 3, bt + 11),
+                (back_rect.right - 3, bt + 11),
+            ], 2)
+            body = pygame.Rect(bl + 5, bt + 11, back_rect.width - 10, back_rect.height - 14)
+            pygame.draw.rect(self.display_surface, back_color, body, 2)
+            pygame.draw.rect(self.display_surface, back_color, pygame.Rect(back_rect.centerx - 2, body.bottom - 6, 4, 6), 2)
+
+            trash_color = (255, 90, 90) if trash_hit_rect.collidepoint(mouse_pos) else (200, 120, 120)
+            tl, tt = trash_rect.left, trash_rect.top
+            pygame.draw.rect(self.display_surface, trash_color, (tl + 9, tt + 3, 6, 2))
+            pygame.draw.rect(self.display_surface, trash_color, (tl + 4, tt + 6, 16, 2))
+            pygame.draw.rect(self.display_surface, trash_color, (tl + 6, tt + 9, 12, 12), 2)
+            pygame.draw.line(self.display_surface, trash_color, (tl + 10, tt + 12), (tl + 10, tt + 18), 2)
+            pygame.draw.line(self.display_surface, trash_color, (tl + 14, tt + 12), (tl + 14, tt + 18), 2)
+
             is_minus_hover = minus_hit_rect.collidepoint(mouse_pos)
             is_plus_hover = plus_hit_rect.collidepoint(mouse_pos)
-            is_text_hover = dur_control_hit_rect.collidepoint(mouse_pos)
-            
-            dur_color = (255, 255, 255) if is_text_hover else (180, 180, 180)
-            btn_color_hover = (255, 255, 255)
-            btn_color_normal = (150, 150, 150)
-            
-            # Draw Minus
-            minus_color = btn_color_hover if is_minus_hover else btn_color_normal
+            dur_color = (255, 255, 255) if dur_control_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+            btn_hi = (255, 255, 255)
+            btn_lo = (150, 150, 150)
+
+            minus_color = btn_hi if is_minus_hover else btn_lo
             pygame.draw.line(self.display_surface, minus_color, (minus_rect.left + 5, minus_rect.centery), (minus_rect.right - 5, minus_rect.centery), 2)
-            
-            # Draw Plus
-            plus_color = btn_color_hover if is_plus_hover else btn_color_normal
+
+            plus_color = btn_hi if is_plus_hover else btn_lo
             pygame.draw.line(self.display_surface, plus_color, (plus_rect.left + 5, plus_rect.centery), (plus_rect.right - 5, plus_rect.centery), 2)
             pygame.draw.line(self.display_surface, plus_color, (plus_rect.centerx, plus_rect.top + 5), (plus_rect.centerx, plus_rect.bottom - 5), 2)
-            
-            # Draw Text
+
             dur_str = f"{self.slide_duration/1000:.1f}s"
-            font = self.font_local if self.font_local else self.font_cjk
             try:
-                text_surf = font.render(dur_str, True, dur_color)
-                text_rect_center = text_surf.get_rect(center=text_rect.center)
-                self.display_surface.blit(text_surf, text_rect_center)
-            except:
-                pass
+                text_surf = dur_font.render(dur_str, True, dur_color)
+                self.display_surface.blit(text_surf, text_surf.get_rect(center=dur_text_rect.center))
+            except Exception as e:
+                print(f"dur render failed: {e}")
 
             pygame.display.flip()
             self.clock.tick(30)
 
-        pygame.quit()
-        sys.exit()
+class FilePicker:
+    """Compact pygame picker for selecting a slideshow list from recents."""
+
+    BG = (18, 18, 22)
+    PANEL = (28, 28, 34)
+    ROW_HOVER = (40, 44, 56)
+    ROW_PRESSED = (56, 60, 76)
+    TEXT = (220, 220, 220)
+    TEXT_DIM = (130, 130, 130)
+    TEXT_MISSING = (110, 90, 90)
+    ACCENT = (100, 200, 255)
+    CLOSE_HOVER = (255, 80, 80)
+    TRASH_HOVER = (255, 120, 120)
+    BORDER = (50, 50, 60)
+
+    def __init__(self):
+        self.width = 420
+        self.height = 400
+        os.environ['SDL_VIDEO_CENTERED'] = '1'
+        self.surface = pygame.display.set_mode((self.width, self.height), pygame.NOFRAME)
+        pygame.display.set_caption("Instant Slideshow - Select List")
+        self.clock = pygame.time.Clock()
+
+        self.font = load_local_font(14) or pygame.font.SysFont('arial', 14)
+        self.font_bold = load_local_font(15) or pygame.font.SysFont('arial', 15, bold=True)
+        self.font_small = load_local_font(11) or pygame.font.SysFont('arial', 11)
+
+        self.recents = load_recents()
+        self._existence = [os.path.exists(r['path']) for r in self.recents]
+
+        self.duration = 30
+        self.sort_order = 'random'
+
+        self.header_h = 34
+        self.row_h = 26
+        self.rows_max = 10
+        self.rows_y = self.header_h + 4
+        self.rows_area = pygame.Rect(0, self.rows_y, self.width, self.row_h * self.rows_max)
+        self.controls_y = self.rows_area.bottom + 8
+        self.path_bar_y = self.controls_y + 36
+        self.scroll_offset = 0
+
+        # Precompute constant rects (picker size never changes)
+        self._close_rect_cache = pygame.Rect(self.width - 28, 6, 22, 22)
+        y = self.controls_y
+        browse = pygame.Rect(10, y, 92, 28)
+        minus = pygame.Rect(browse.right + 18, y, 22, 28)
+        text = pygame.Rect(minus.right, y, 58, 28)
+        plus = pygame.Rect(text.right, y, 22, 28)
+        sort_btn = pygame.Rect(plus.right + 18, y, self.width - (plus.right + 18) - 10, 28)
+        self._controls = (browse, minus, text, plus, sort_btn)
+
+        self.hover_row = -1
+        self.hover_remove_row = -1
+        self.pressed = None
+
+        self.dragging = False
+        self.pending_drag = False
+        self.drag_start = (0, 0)
+        self.drag_offset = (0, 0)
+        self.drag_threshold = 6
+
+        self.result = None
+        self.running = True
+
+    def _row_rect(self, visible_idx):
+        return pygame.Rect(8, self.rows_y + visible_idx * self.row_h, self.width - 16, self.row_h - 2)
+
+    def _remove_rect(self, visible_idx):
+        r = self._row_rect(visible_idx)
+        return pygame.Rect(r.right - 22, r.top + (r.height - 16) // 2, 16, 16)
+
+    def _close_rect(self):
+        return self._close_rect_cache
+
+    def _controls_rects(self):
+        return self._controls
+
+    def _scrollbar_rect(self):
+        if len(self.recents) <= self.rows_max:
+            return None
+        track = pygame.Rect(self.width - 6, self.rows_y, 4, self.rows_area.height)
+        total = len(self.recents)
+        thumb_h = max(24, int(track.height * self.rows_max / total))
+        max_scroll = total - self.rows_max
+        frac = self.scroll_offset / max_scroll if max_scroll else 0
+        thumb_y = track.top + int((track.height - thumb_h) * frac)
+        return pygame.Rect(track.left, thumb_y, track.width, thumb_h)
+
+    def _scroll(self, delta):
+        max_scroll = max(0, len(self.recents) - self.rows_max)
+        self.scroll_offset = max(0, min(max_scroll, self.scroll_offset + delta))
+
+    def _visible_recents(self):
+        end = min(len(self.recents), self.scroll_offset + self.rows_max)
+        for i in range(self.scroll_offset, end):
+            yield i - self.scroll_offset, i, self.recents[i]
+
+    def _pick_row_at(self, pos):
+        if not self.rows_area.collidepoint(pos):
+            return -1, -1
+        for vi, ri, _ in self._visible_recents():
+            if self._row_rect(vi).collidepoint(pos):
+                return vi, ri
+        return -1, -1
+
+    def _browse(self):
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes('-topmost', True)
+            path = filedialog.askopenfilename(
+                title="Select list file",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+            )
+            root.destroy()
+        except Exception as e:
+            print(f"{Fore.RED}Browse dialog failed: {e}")
+            return
+        if path:
+            self.result = (path, self.duration, self.sort_order)
+            self.running = False
+
+    def _remove_recent(self, idx):
+        if 0 <= idx < len(self.recents):
+            del self.recents[idx]
+            del self._existence[idx]
+            save_recents(self.recents)
+            max_scroll = max(0, len(self.recents) - self.rows_max)
+            if self.scroll_offset > max_scroll:
+                self.scroll_offset = max_scroll
+
+    def _select_recent(self, idx):
+        if not (0 <= idx < len(self.recents)):
+            return
+        entry = self.recents[idx]
+        if not self._existence[idx]:
+            self._remove_recent(idx)
+            return
+        self.result = (entry['path'], entry.get('duration', 30), entry.get('sort', 'random'))
+        self.running = False
+
+    def _handle_events(self):
+        mouse_pos = pygame.mouse.get_pos()
+        self.hover_row = -1
+        self.hover_remove_row = -1
+        if self.rows_area.collidepoint(mouse_pos):
+            for vi, ri, _ in self._visible_recents():
+                if self._row_rect(vi).collidepoint(mouse_pos):
+                    self.hover_row = ri
+                    if self._remove_rect(vi).collidepoint(mouse_pos):
+                        self.hover_remove_row = ri
+                    break
+
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                self.running = False
+
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_ESCAPE:
+                    self.running = False
+
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 1:
+                    self.pressed = None
+                    self.dragging = False
+                    self.pending_drag = False
+
+                    browse, minus, text_r, plus, sort_btn = self._controls_rects()
+                    close = self._close_rect()
+
+                    if close.collidepoint(event.pos):
+                        self.pressed = ('close',)
+                    elif browse.collidepoint(event.pos):
+                        self.pressed = ('browse',)
+                    elif minus.collidepoint(event.pos):
+                        self.pressed = ('minus',)
+                    elif plus.collidepoint(event.pos):
+                        self.pressed = ('plus',)
+                    elif sort_btn.collidepoint(event.pos):
+                        self.pressed = ('sort',)
+                    else:
+                        vi, ri = self._pick_row_at(event.pos)
+                        if ri >= 0:
+                            if self._remove_rect(vi).collidepoint(event.pos):
+                                self.pressed = ('remove', ri)
+                            else:
+                                self.pressed = ('row', ri)
+                        elif event.pos[1] < self.header_h:
+                            self.pending_drag = True
+                            self.drag_start = event.pos
+                            self.drag_offset = event.pos
+
+                elif event.button == 4:
+                    self._scroll(-1)
+                elif event.button == 5:
+                    self._scroll(1)
+
+            elif event.type == pygame.MOUSEBUTTONUP:
+                if event.button == 1 and self.pressed and not self.dragging:
+                    kind = self.pressed[0]
+                    if kind == 'close' and self._close_rect().collidepoint(event.pos):
+                        self.running = False
+                    elif kind == 'browse':
+                        browse, *_ = self._controls_rects()
+                        if browse.collidepoint(event.pos):
+                            self._browse()
+                    elif kind == 'minus':
+                        _, minus, _, _, _ = self._controls_rects()
+                        if minus.collidepoint(event.pos):
+                            self.duration = max(1, self.duration - 1)
+                    elif kind == 'plus':
+                        _, _, _, plus, _ = self._controls_rects()
+                        if plus.collidepoint(event.pos):
+                            self.duration = min(3600, self.duration + 1)
+                    elif kind == 'sort':
+                        _, _, _, _, sort_btn = self._controls_rects()
+                        if sort_btn.collidepoint(event.pos):
+                            self.sort_order = 'name' if self.sort_order == 'random' else 'random'
+                    elif kind == 'remove':
+                        idx = self.pressed[1]
+                        vi_candidate = idx - self.scroll_offset
+                        if 0 <= vi_candidate < self.rows_max and self._remove_rect(vi_candidate).collidepoint(event.pos):
+                            self._remove_recent(idx)
+                    elif kind == 'row':
+                        idx = self.pressed[1]
+                        vi_candidate = idx - self.scroll_offset
+                        if 0 <= vi_candidate < self.rows_max and self._row_rect(vi_candidate).collidepoint(event.pos):
+                            self._select_recent(idx)
+
+                if event.button == 1:
+                    self.pressed = None
+                    self.dragging = False
+                    self.pending_drag = False
+
+            elif event.type == pygame.MOUSEMOTION:
+                if self.pending_drag and not self.dragging:
+                    dx = abs(event.pos[0] - self.drag_start[0])
+                    dy = abs(event.pos[1] - self.drag_start[1])
+                    if dx >= self.drag_threshold or dy >= self.drag_threshold:
+                        self.dragging = True
+                if self.dragging and os.name == 'nt':
+                    pt = POINT()
+                    ctypes.windll.user32.GetCursorPos(ctypes.byref(pt))
+                    hwnd = pygame.display.get_wm_info()['window']
+                    ctypes.windll.user32.SetWindowPos(
+                        hwnd, 0,
+                        pt.x - self.drag_offset[0], pt.y - self.drag_offset[1],
+                        0, 0, 0x0001 | 0x0004,
+                    )
+
+    def _truncate(self, text, max_w, font):
+        if font.size(text)[0] <= max_w:
+            return text
+        ellipsis = '...'
+        lo, hi = 0, len(text)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if font.size(text[:mid] + ellipsis)[0] <= max_w:
+                lo = mid + 1
+            else:
+                hi = mid
+        return text[: max(0, lo - 1)] + ellipsis
+
+    def _draw(self):
+        mouse_pos = pygame.mouse.get_pos()
+        self.surface.fill(self.BG)
+
+        # Header
+        pygame.draw.rect(self.surface, self.PANEL, (0, 0, self.width, self.header_h))
+        pygame.draw.line(self.surface, self.BORDER, (0, self.header_h), (self.width, self.header_h))
+        title = self.font_bold.render("Select Slideshow", True, self.TEXT)
+        self.surface.blit(title, (12, (self.header_h - title.get_height()) // 2))
+
+        # Close button
+        close = self._close_rect()
+        close_hover = close.collidepoint(mouse_pos)
+        cc = self.CLOSE_HOVER if close_hover else self.TEXT_DIM
+        draw_close_x(self.surface, close, cc)
+
+        # Rows
+        if not self.recents:
+            msg = self.font.render("No recent lists. Click Browse to select one.", True, self.TEXT_DIM)
+            self.surface.blit(msg, (self.rows_area.centerx - msg.get_width() // 2,
+                                    self.rows_area.centery - msg.get_height() // 2))
+        else:
+            for vi, ri, entry in self._visible_recents():
+                row = self._row_rect(vi)
+                exists = self._existence[ri]
+                is_hover = (ri == self.hover_row)
+                if is_hover:
+                    pygame.draw.rect(self.surface, self.ROW_HOVER, row, border_radius=4)
+
+                filename = os.path.basename(entry['path']) or entry['path']
+                color = self.TEXT if exists else self.TEXT_MISSING
+                text_max_w = row.width - 40
+                filename_r = self.font.render(self._truncate(filename, text_max_w, self.font), True, color)
+                self.surface.blit(filename_r, (row.left + 10, row.top + (row.height - filename_r.get_height()) // 2))
+
+                if is_hover:
+                    rm = self._remove_rect(vi)
+                    rm_hover = (ri == self.hover_remove_row)
+                    rc = self.CLOSE_HOVER if rm_hover else self.TEXT_DIM
+                    draw_close_x(self.surface, rm, rc, pad=4)
+
+            sb = self._scrollbar_rect()
+            if sb:
+                pygame.draw.rect(self.surface, self.BORDER, sb, border_radius=2)
+
+        # Controls panel
+        browse, minus, text_r, plus, sort_btn = self._controls_rects()
+
+        # Browse button
+        browse_hover = browse.collidepoint(mouse_pos)
+        pygame.draw.rect(self.surface, self.ROW_HOVER if browse_hover else self.PANEL, browse, border_radius=4)
+        pygame.draw.rect(self.surface, self.BORDER, browse, 1, border_radius=4)
+        btxt = self.font.render("Browse...", True, self.ACCENT if browse_hover else self.TEXT)
+        self.surface.blit(btxt, btxt.get_rect(center=browse.center))
+
+        # Duration: - [30.0s] +
+        minus_hover = minus.collidepoint(mouse_pos)
+        plus_hover = plus.collidepoint(mouse_pos)
+        dur_color = self.TEXT
+        mcol = self.TEXT if minus_hover else self.TEXT_DIM
+        pcol = self.TEXT if plus_hover else self.TEXT_DIM
+        pygame.draw.line(self.surface, mcol, (minus.left + 6, minus.centery), (minus.right - 6, minus.centery), 2)
+        pygame.draw.line(self.surface, pcol, (plus.left + 6, plus.centery), (plus.right - 6, plus.centery), 2)
+        pygame.draw.line(self.surface, pcol, (plus.centerx, plus.top + 6), (plus.centerx, plus.bottom - 6), 2)
+        dur_txt = self.font.render(f"{self.duration}s", True, dur_color)
+        self.surface.blit(dur_txt, dur_txt.get_rect(center=text_r.center))
+
+        # Sort toggle
+        sort_hover = sort_btn.collidepoint(mouse_pos)
+        pygame.draw.rect(self.surface, self.ROW_HOVER if sort_hover else self.PANEL, sort_btn, border_radius=4)
+        pygame.draw.rect(self.surface, self.BORDER, sort_btn, 1, border_radius=4)
+        sort_label = f"Sort: {self.sort_order}"
+        stxt = self.font.render(sort_label, True, self.ACCENT if sort_hover else self.TEXT)
+        self.surface.blit(stxt, stxt.get_rect(center=sort_btn.center))
+
+        # Hover path bar
+        hint_rect = pygame.Rect(0, self.path_bar_y, self.width, self.height - self.path_bar_y)
+        pygame.draw.line(self.surface, self.BORDER, (0, self.path_bar_y), (self.width, self.path_bar_y))
+        if self.hover_row >= 0:
+            entry = self.recents[self.hover_row]
+            path = entry['path']
+            if not self._existence[self.hover_row]:
+                path += "  (missing \u2014 click to remove)"
+            path_txt = self._truncate(path, self.width - 20, self.font_small)
+            ptxt = self.font_small.render(path_txt, True, self.TEXT_DIM)
+            self.surface.blit(ptxt, (10, hint_rect.top + 6))
+            if entry.get('last_used'):
+                meta = f"last used: {entry['last_used']} | saved: {entry.get('duration', 30)}s {entry.get('sort', 'random')}"
+                mtxt = self.font_small.render(self._truncate(meta, self.width - 20, self.font_small), True, self.TEXT_DIM)
+                self.surface.blit(mtxt, (10, hint_rect.top + 22))
+        else:
+            hint = self.font_small.render(
+                "Click a list to launch with its saved settings. Browse uses the settings below.",
+                True, self.TEXT_DIM,
+            )
+            self.surface.blit(hint, (10, hint_rect.top + 6))
+
+    def run(self):
+        while self.running:
+            self._handle_events()
+            self._draw()
+            pygame.display.flip()
+            self.clock.tick(30)
+        return self.result
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Instant Slideshow from a text file of paths.")
     parser.add_argument("file", nargs="?", help="Path to the text file containing image paths")
     parser.add_argument("-d", "--duration", type=float, help="Slide duration in seconds")
     parser.add_argument("-s", "--sort", choices=['random', 'name'], help="Sort order: random (default) or name")
-    
+
     args = parser.parse_args()
-    
-    InstantSlideshow(file_path=args.file, duration=args.duration, sort_order=args.sort)
+
+    file_path = args.file
+    duration = args.duration
+    sort_order = args.sort
+
+    try:
+        while True:
+            if not file_path:
+                picker_result = FilePicker().run()
+                if not picker_result:
+                    print(f"{Fore.YELLOW}No list selected. Exiting.")
+                    break
+                file_path, duration, sort_order = picker_result
+
+            slideshow = InstantSlideshow(file_path=file_path, duration=duration, sort_order=sort_order)
+            if slideshow.next_action == 'picker':
+                file_path = None
+                duration = None
+                sort_order = None
+                continue
+            break
+    finally:
+        pygame.quit()
+        sys.exit()

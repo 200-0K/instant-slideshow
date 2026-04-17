@@ -1,2 +1,8 @@
-*.bat
+.venv/
+__pycache__/
+*.pyc
+
+# User-local state
+recents.json
 last_selected_list.txt
+*.bat
