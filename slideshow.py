@@ -168,6 +168,7 @@ class InstantSlideshow:
         self.drag_start_pos = (0, 0)
         self.drag_threshold = 6
         self.pressed_control = None
+        self.pending_delete_index = -1
         self.next_action = 'exit'  # set to 'picker' to return to the picker on exit
 
         self.is_gif = False
@@ -506,27 +507,53 @@ class InstantSlideshow:
         except Exception as e:
             print(f"Error opening media: {e}")
 
-    def delete_current_image(self):
-        if not self.image_paths:
+    def _draw_busy_overlay(self, message):
+        if not self.display_surface:
             return
-        path = self.image_paths[self.current_index]
+        w, h = self.display_surface.get_size()
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.display_surface.blit(overlay, (0, 0))
+        font = self.font_local if self.font_local else self.font_cjk
+        try:
+            txt = font.render(message, True, (255, 255, 255))
+            self.display_surface.blit(txt, txt.get_rect(center=(w // 2, h // 2)))
+        except Exception:
+            pass
+        pygame.display.flip()
+
+    def delete_image_at(self, idx):
+        if not self.image_paths or idx < 0 or idx >= len(self.image_paths):
+            return
+        path = self.image_paths[idx]
+
+        self._draw_busy_overlay("Deleting...")
+
         try:
             send2trash(os.path.normpath(path))
             print(f"{Fore.YELLOW}Moved to Recycle Bin: {Style.BRIGHT}{path}")
         except Exception as e:
             print(f"{Fore.RED}Error deleting {path}: {e}")
             return
+        finally:
+            # Drop clicks that queued up during the blocking delete so
+            # they don't replay as extra deletes on the next image.
+            pygame.event.clear([pygame.MOUSEBUTTONDOWN, pygame.MOUSEBUTTONUP])
 
-        del self.image_paths[self.current_index]
+        del self.image_paths[idx]
 
         if not self.image_paths:
             print(f"{Fore.YELLOW}Playlist is empty. Exiting.")
             self.running = False
             return
 
+        was_current = (idx == self.current_index)
+        if idx < self.current_index:
+            self.current_index -= 1
         if self.current_index >= len(self.image_paths):
             self.current_index = 0
-        self.load_current_image()
+        if was_current:
+            self.load_current_image()
 
     def get_sort_order(self):
         if self.sort_order_arg:
@@ -585,7 +612,11 @@ class InstantSlideshow:
         while self.running:
             current_time = pygame.time.get_ticks()
 
-            if not self.paused and current_time - self.last_switch_time > self.slide_duration:
+            # Freeze auto-advance while a UI button is held so the release
+            # acts on the image the user was looking at when they pressed.
+            if (not self.paused
+                    and self.pressed_control is None
+                    and current_time - self.last_switch_time > self.slide_duration):
                 self.next_image()
 
             if not self.paused and self.is_gif and self.scaled_gif_frames:
@@ -622,6 +653,7 @@ class InstantSlideshow:
                             self.pressed_control = 'media'
                         elif trash_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'trash'
+                            self.pending_delete_index = self.current_index
                         elif back_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'back'
                         elif plus_hit_rect.collidepoint(event.pos):
@@ -662,7 +694,7 @@ class InstantSlideshow:
                             elif self.pressed_control == 'media' and media_hit_rect.collidepoint(event.pos):
                                 self.open_current_media()
                             elif self.pressed_control == 'trash' and trash_hit_rect.collidepoint(event.pos):
-                                self.delete_current_image()
+                                self.delete_image_at(self.pending_delete_index)
                             elif self.pressed_control == 'back' and back_hit_rect.collidepoint(event.pos):
                                 self.next_action = 'picker'
                                 self.running = False
@@ -732,7 +764,15 @@ class InstantSlideshow:
             pygame.draw.rect(self.display_surface, back_color, body, 2)
             pygame.draw.rect(self.display_surface, back_color, pygame.Rect(back_rect.centerx - 2, body.bottom - 6, 4, 6), 2)
 
-            trash_color = (255, 90, 90) if trash_hit_rect.collidepoint(mouse_pos) else (200, 120, 120)
+            is_trash_hover = trash_hit_rect.collidepoint(mouse_pos)
+            is_trash_pressed = self.pressed_control == 'trash' and is_trash_hover
+            if is_trash_pressed:
+                pygame.draw.rect(self.display_surface, (90, 25, 25), trash_rect.inflate(6, 6), border_radius=4)
+                trash_color = (255, 60, 60)
+            elif is_trash_hover:
+                trash_color = (255, 90, 90)
+            else:
+                trash_color = (200, 120, 120)
             tl, tt = trash_rect.left, trash_rect.top
             pygame.draw.rect(self.display_surface, trash_color, (tl + 9, tt + 3, 6, 2))
             pygame.draw.rect(self.display_surface, trash_color, (tl + 4, tt + 6, 16, 2))
