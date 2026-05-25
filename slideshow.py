@@ -910,23 +910,53 @@ class FilePicker:
         return -1, -1
 
     def _browse(self):
+        path = self._open_file_dialog()
+        if path:
+            self.result = (path, self.duration, self.sort_order)
+            self.running = False
+
+    @staticmethod
+    def _open_file_dialog():
+        if os.name == 'nt':
+            try:
+                result = FilePicker._win32_file_dialog()
+            except Exception as e:
+                print(f"{Fore.RED}Windows file dialog failed: {e}")
+            else:
+                return result
         try:
             import tkinter as tk
             from tkinter import filedialog
             root = tk.Tk()
             root.withdraw()
             root.attributes('-topmost', True)
+            root.lift()
+            root.focus_force()
             path = filedialog.askopenfilename(
                 title="Select list file",
                 filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
             )
             root.destroy()
+            return path or None
         except Exception as e:
             print(f"{Fore.RED}Browse dialog failed: {e}")
-            return
-        if path:
-            self.result = (path, self.duration, self.sort_order)
-            self.running = False
+            return None
+
+    @staticmethod
+    def _win32_file_dialog():
+        ps_script = (
+            'Add-Type -AssemblyName System.Windows.Forms;'
+            '$f=New-Object System.Windows.Forms.OpenFileDialog;'
+            '$f.Filter="Text files (*.txt)|*.txt|All files (*.*)|*.*";'
+            '$f.Title="Select list file";'
+            'if($f.ShowDialog() -eq "OK"){$f.FileName}'
+        )
+        proc = subprocess.run(
+            ['powershell', '-NoProfile', '-Command', ps_script],
+            capture_output=True, text=True, timeout=120,
+        )
+        path = proc.stdout.strip()
+        return path if path else None
 
     def _remove_recent(self, idx):
         if 0 <= idx < len(self.recents):
