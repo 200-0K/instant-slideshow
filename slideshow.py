@@ -787,9 +787,7 @@ class InstantSlideshow:
                     self.running = False
                 
                 elif event.type == pygame.KEYDOWN:
-                    if event.key == pygame.K_ESCAPE:
-                        self.running = False
-                    elif event.key == pygame.K_RIGHT:
+                    if event.key == pygame.K_RIGHT:
                         self.next_image()
                     elif event.key == pygame.K_LEFT:
                         self.prev_image()
@@ -1100,10 +1098,6 @@ class FilePicker:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
-
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_ESCAPE:
-                    self.running = False
 
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
