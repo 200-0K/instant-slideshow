@@ -8,6 +8,7 @@ import subprocess
 from datetime import datetime
 from PIL import Image
 import argparse
+import math
 from colorama import init, Fore, Style
 from send2trash import send2trash
 
@@ -192,11 +193,17 @@ class InstantSlideshow:
         self.next_action = 'exit'  # set to 'picker' to return to the picker on exit
 
         self.is_gif = False
+        self.pil_image = None
+        self.original_image = None
+        self.caption_text = ""
         self.gif_frames = []
         self.scaled_gif_frames = []
         self.gif_durations = []
         self.current_gif_frame = 0
         self.last_gif_update = 0
+        self.gif_total_duration = 0
+        self.gif_loop_done = True
+        self._show_load_spinner = False
 
         self.load_paths()
 
@@ -319,9 +326,42 @@ class InstantSlideshow:
         
         self.display_surface = pygame.display.set_mode((self.width, self.height), pygame.NOFRAME)
         pygame.display.set_caption("Instant Slideshow")
+        self._compute_header_layout()
+
+    def _compute_header_layout(self):
+        width = self.display_surface.get_width()
+        self.header_h = 50
+        btn_size = 24
+        margin = 12
+        spacing = 10
+
+        # Button areas (right-to-left): [close] [folder] [media] [trash] [back] [+ dur -]
+        self.close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
+        self.folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
+        self.media_rect = pygame.Rect(self.folder_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+        self.trash_rect = pygame.Rect(self.media_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+        self.back_rect = pygame.Rect(self.trash_rect.left - spacing - btn_size, margin, btn_size, btn_size)
+
+        dur_btn_w = 20
+        dur_text_w = 50
+        self.plus_rect = pygame.Rect(self.back_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
+        self.dur_text_rect = pygame.Rect(self.plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
+        self.minus_rect = pygame.Rect(self.dur_text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
+        self.dur_control_rect = pygame.Rect(self.minus_rect.left, margin, self.plus_rect.right - self.minus_rect.left, btn_size)
+
+        hit_padding = 12
+        self.close_hit_rect = self.close_rect.inflate(hit_padding, hit_padding)
+        self.folder_hit_rect = self.folder_rect.inflate(hit_padding, hit_padding)
+        self.media_hit_rect = self.media_rect.inflate(hit_padding, hit_padding)
+        self.trash_hit_rect = self.trash_rect.inflate(hit_padding, hit_padding)
+        self.back_hit_rect = self.back_rect.inflate(hit_padding, hit_padding)
+        self.plus_hit_rect = self.plus_rect.inflate(hit_padding, hit_padding)
+        self.minus_hit_rect = self.minus_rect.inflate(hit_padding, hit_padding)
+        self.dur_control_hit_rect = self.dur_control_rect.inflate(hit_padding, hit_padding)
+
+        self.dur_font = self.font_local if self.font_local else self.font_cjk
 
     def load_current_image(self):
-        self.last_switch_time = pygame.time.get_ticks()
         if not self.image_paths:
             return
             
@@ -332,44 +372,61 @@ class InstantSlideshow:
         pygame.display.set_caption(self.caption_text)
         
         try:
-            # Use PIL to load image
-            self.pil_image = Image.open(path)
-            
-            # Check if animated GIF
-            self.is_gif = getattr(self.pil_image, "is_animated", False)
-            
-            if self.is_gif:
-                self.gif_frames = []
-                self.gif_durations = []
-                self.current_gif_frame = 0
+            with Image.open(path) as self.pil_image:
+                self.is_gif = getattr(self.pil_image, "is_animated", False)
                 
-                # Extract all frames
-                for i in range(self.pil_image.n_frames):
-                    self.pil_image.seek(i)
-                    # Convert to RGBA to ensure consistency
-                    frame = self.pil_image.copy().convert('RGBA')
-                    self.gif_frames.append(frame)
-                    # Get duration (default to 100ms if not specified)
-                    self.gif_durations.append(self.pil_image.info.get('duration', 100))
-            else:
-                # Static image
-                self.original_image = self.pil_image.convert('RGBA')
+                if self.is_gif:
+                    self._show_load_spinner = (
+                        self.pil_image.n_frames > 30
+                        or os.path.getsize(path) > 5 * 1024 * 1024
+                    )
+                    self.gif_frames = []
+                    self.gif_durations = []
+                    self.current_gif_frame = 0
+                    
+                    for i in range(self.pil_image.n_frames):
+                        self.pil_image.seek(i)
+                        # copy() freezes the frame before the next seek()
+                        frame = self.pil_image.copy().convert('RGBA')
+                        self.gif_frames.append(frame)
+                        self.gif_durations.append(self.pil_image.info.get('duration', 100))
+                        if self._show_load_spinner:
+                            self._draw_loading_overlay()
+                    
+                    self.gif_total_duration = sum(self.gif_durations)
+                    self.gif_loop_done = False
+                else:
+                    self._show_load_spinner = False
+                    self.original_image = self.pil_image.convert('RGBA')
+                    self.gif_total_duration = 0
+                    self.gif_loop_done = True
+                    
+                self.rescale_image()
                 
-            self.rescale_image()
-            
         except Exception as e:
             print(f"Error loading image {path}: {e}")
             self.current_image = None
             self.is_gif = False
+            self.gif_total_duration = 0
+            self.gif_loop_done = True
+            self._show_load_spinner = False
+
+        now = pygame.time.get_ticks()
+        self.last_switch_time = now
+        self.last_gif_update = now
+
+    @staticmethod
+    def _pil_to_surface(pil_img, size):
+        scaled = pil_img.resize(size, Image.Resampling.LANCZOS)
+        return pygame.image.frombytes(scaled.tobytes(), scaled.size, scaled.mode)
 
     def rescale_image(self):
-        if not hasattr(self, 'pil_image'):
+        if self.pil_image is None:
             return
 
-        # Determine dimensions from the first frame or the static image
         if self.is_gif and self.gif_frames:
             img_w, img_h = self.gif_frames[0].size
-        elif hasattr(self, 'original_image'):
+        elif self.original_image is not None:
             img_w, img_h = self.original_image.size
         else:
             return
@@ -382,30 +439,22 @@ class InstantSlideshow:
         new_h = int(img_h * ratio)
         
         if new_w > 0 and new_h > 0:
-            # Center image on surface
             self.img_x = (win_w - new_w) // 2
             self.img_y = (win_h - new_h) // 2
             
             if self.is_gif:
                 self.scaled_gif_frames = []
-                # Rescale all frames
                 for frame in self.gif_frames:
-                    scaled = frame.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                    # Convert PIL image to Pygame surface
-                    mode = scaled.mode
-                    size = scaled.size
-                    data = scaled.tobytes()
-                    surf = pygame.image.frombytes(data, size, mode)
-                    self.scaled_gif_frames.append(surf)
+                    self.scaled_gif_frames.append(
+                        self._pil_to_surface(frame, (new_w, new_h))
+                    )
+                    if self._show_load_spinner:
+                        self._draw_loading_overlay()
                 
                 if self.scaled_gif_frames:
                     self.current_image = self.scaled_gif_frames[0]
             else:
-                scaled = self.original_image.resize((new_w, new_h), Image.Resampling.LANCZOS)
-                mode = scaled.mode
-                size = scaled.size
-                data = scaled.tobytes()
-                self.current_image = pygame.image.frombytes(data, size, mode)
+                self.current_image = self._pil_to_surface(self.original_image, (new_w, new_h))
 
     def next_image(self):
         if not self.image_paths: return
@@ -503,7 +552,6 @@ class InstantSlideshow:
             # effectively pushing the deadline forward
             offset = current_time - self.pause_start_time
             self.last_switch_time += offset
-            self.last_gif_update += offset
 
     def open_current_folder(self):
         if not self.image_paths: return
@@ -549,7 +597,104 @@ class InstantSlideshow:
             self.display_surface.blit(txt, txt.get_rect(center=(w // 2, h // 2)))
         except Exception:
             pass
+        self._draw_header()
         pygame.display.flip()
+
+    def _draw_loading_overlay(self):
+        if not self.display_surface:
+            return
+        w, h = self.display_surface.get_size()
+        self.display_surface.fill((0, 0, 0))
+        if self.current_image:
+            rect = self.current_image.get_rect(center=(w // 2, h // 2))
+            self.display_surface.blit(self.current_image, rect)
+        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 140))
+        self.display_surface.blit(overlay, (0, 0))
+
+        cx, cy = w // 2, h // 2
+        r = 24
+        sweep = math.radians(90)
+        start = math.radians((pygame.time.get_ticks() / 3) % 360)
+        pygame.draw.arc(self.display_surface, (255, 255, 255),
+                        (cx - r, cy - r, r * 2, r * 2),
+                        start, start + sweep, 4)
+        self._draw_header()
+        pygame.event.pump()
+        pygame.display.flip()
+
+    def _draw_header(self):
+        mouse_pos = pygame.mouse.get_pos()
+
+        header_surf = pygame.Surface((self.display_surface.get_width(), self.header_h), pygame.SRCALPHA)
+        header_surf.fill((0, 0, 0, 180))
+        self.display_surface.blit(header_surf, (0, 0))
+
+        if self.caption_text:
+            display_text = self.caption_text
+            if self.paused:
+                display_text += " [PAUSED]"
+            self.draw_text_mixed(self.display_surface, display_text, (15, 15), (0, 255, 0))
+
+        close_color = (255, 80, 80) if self.close_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+        draw_close_x(self.display_surface, self.close_rect, close_color)
+
+        folder_color = (100, 200, 255) if self.folder_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+        pygame.draw.rect(self.display_surface, folder_color, (self.folder_rect.left + 2, self.folder_rect.top + 3, 9, 4))
+        pygame.draw.rect(self.display_surface, folder_color, (self.folder_rect.left + 2, self.folder_rect.top + 7, 20, 13))
+
+        media_color = (100, 255, 100) if self.media_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+        pygame.draw.rect(self.display_surface, media_color, (self.media_rect.left + 2, self.media_rect.top + 4, 20, 16), 2)
+        pygame.draw.circle(self.display_surface, media_color, (self.media_rect.left + 8, self.media_rect.top + 9), 2)
+        pygame.draw.line(self.display_surface, media_color, (self.media_rect.left + 4, self.media_rect.bottom - 6), (self.media_rect.left + 10, self.media_rect.bottom - 12), 2)
+        pygame.draw.line(self.display_surface, media_color, (self.media_rect.left + 10, self.media_rect.bottom - 12), (self.media_rect.right - 4, self.media_rect.bottom - 6), 2)
+
+        back_color = (255, 200, 100) if self.back_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+        bl, bt = self.back_rect.left, self.back_rect.top
+        pygame.draw.polygon(self.display_surface, back_color, [
+            (self.back_rect.centerx, bt + 3),
+            (bl + 3, bt + 11),
+            (self.back_rect.right - 3, bt + 11),
+        ], 2)
+        body = pygame.Rect(bl + 5, bt + 11, self.back_rect.width - 10, self.back_rect.height - 14)
+        pygame.draw.rect(self.display_surface, back_color, body, 2)
+        pygame.draw.rect(self.display_surface, back_color, pygame.Rect(self.back_rect.centerx - 2, body.bottom - 6, 4, 6), 2)
+
+        is_trash_hover = self.trash_hit_rect.collidepoint(mouse_pos)
+        is_trash_pressed = self.pressed_control == 'trash' and is_trash_hover
+        if is_trash_pressed:
+            pygame.draw.rect(self.display_surface, (90, 25, 25), self.trash_rect.inflate(6, 6), border_radius=4)
+            trash_color = (255, 60, 60)
+        elif is_trash_hover:
+            trash_color = (255, 90, 90)
+        else:
+            trash_color = (200, 120, 120)
+        tl, tt = self.trash_rect.left, self.trash_rect.top
+        pygame.draw.rect(self.display_surface, trash_color, (tl + 9, tt + 3, 6, 2))
+        pygame.draw.rect(self.display_surface, trash_color, (tl + 4, tt + 6, 16, 2))
+        pygame.draw.rect(self.display_surface, trash_color, (tl + 6, tt + 9, 12, 12), 2)
+        pygame.draw.line(self.display_surface, trash_color, (tl + 10, tt + 12), (tl + 10, tt + 18), 2)
+        pygame.draw.line(self.display_surface, trash_color, (tl + 14, tt + 12), (tl + 14, tt + 18), 2)
+
+        is_minus_hover = self.minus_hit_rect.collidepoint(mouse_pos)
+        is_plus_hover = self.plus_hit_rect.collidepoint(mouse_pos)
+        dur_color = (255, 255, 255) if self.dur_control_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
+        btn_hi = (255, 255, 255)
+        btn_lo = (150, 150, 150)
+
+        minus_color = btn_hi if is_minus_hover else btn_lo
+        pygame.draw.line(self.display_surface, minus_color, (self.minus_rect.left + 5, self.minus_rect.centery), (self.minus_rect.right - 5, self.minus_rect.centery), 2)
+
+        plus_color = btn_hi if is_plus_hover else btn_lo
+        pygame.draw.line(self.display_surface, plus_color, (self.plus_rect.left + 5, self.plus_rect.centery), (self.plus_rect.right - 5, self.plus_rect.centery), 2)
+        pygame.draw.line(self.display_surface, plus_color, (self.plus_rect.centerx, self.plus_rect.top + 5), (self.plus_rect.centerx, self.plus_rect.bottom - 5), 2)
+
+        dur_str = f"{self.slide_duration/1000:.1f}s"
+        try:
+            text_surf = self.dur_font.render(dur_str, True, dur_color)
+            self.display_surface.blit(text_surf, text_surf.get_rect(center=self.dur_text_rect.center))
+        except Exception as e:
+            print(f"dur render failed: {e}")
 
     def delete_image_at(self, idx):
         if not self.image_paths or idx < 0 or idx >= len(self.image_paths):
@@ -615,53 +760,27 @@ class InstantSlideshow:
                            self.sort_order, self.seed, last_image)
 
     def run(self):
-        width = self.display_surface.get_width()
-        header_h = 50
-        btn_size = 24
-        margin = 12
-        spacing = 10
-
-        # Button areas (right-to-left): [close] [folder] [media] [trash] [back] [+ dur -]
-        close_rect = pygame.Rect(width - btn_size - margin, margin, btn_size, btn_size)
-        folder_rect = pygame.Rect(width - btn_size - margin - btn_size - spacing, margin, btn_size, btn_size)
-        media_rect = pygame.Rect(folder_rect.left - spacing - btn_size, margin, btn_size, btn_size)
-        trash_rect = pygame.Rect(media_rect.left - spacing - btn_size, margin, btn_size, btn_size)
-        back_rect = pygame.Rect(trash_rect.left - spacing - btn_size, margin, btn_size, btn_size)
-
-        dur_btn_w = 20
-        dur_text_w = 50
-        plus_rect = pygame.Rect(back_rect.left - spacing - dur_btn_w, margin, dur_btn_w, btn_size)
-        dur_text_rect = pygame.Rect(plus_rect.left - dur_text_w, margin, dur_text_w, btn_size)
-        minus_rect = pygame.Rect(dur_text_rect.left - dur_btn_w, margin, dur_btn_w, btn_size)
-        dur_control_rect = pygame.Rect(minus_rect.left, margin, plus_rect.right - minus_rect.left, btn_size)
-
-        hit_padding = 12
-        close_hit_rect = close_rect.inflate(hit_padding, hit_padding)
-        folder_hit_rect = folder_rect.inflate(hit_padding, hit_padding)
-        media_hit_rect = media_rect.inflate(hit_padding, hit_padding)
-        trash_hit_rect = trash_rect.inflate(hit_padding, hit_padding)
-        back_hit_rect = back_rect.inflate(hit_padding, hit_padding)
-        plus_hit_rect = plus_rect.inflate(hit_padding, hit_padding)
-        minus_hit_rect = minus_rect.inflate(hit_padding, hit_padding)
-        dur_control_hit_rect = dur_control_rect.inflate(hit_padding, hit_padding)
-
-        dur_font = self.font_local if self.font_local else self.font_cjk
-
         while self.running:
             current_time = pygame.time.get_ticks()
 
             # Freeze auto-advance while a UI button is held so the release
             # acts on the image the user was looking at when they pressed.
+            gif_pending = (self.is_gif
+                           and self.gif_total_duration > self.slide_duration
+                           and not self.gif_loop_done)
             if (not self.paused
                     and self.pressed_control is None
-                    and current_time - self.last_switch_time > self.slide_duration):
+                    and current_time - self.last_switch_time > self.slide_duration
+                    and not gif_pending):
                 self.next_image()
 
-            if not self.paused and self.is_gif and self.scaled_gif_frames:
+            if self.is_gif and self.scaled_gif_frames:
                 if current_time - self.last_gif_update > self.gif_durations[self.current_gif_frame]:
                     self.current_gif_frame = (self.current_gif_frame + 1) % len(self.scaled_gif_frames)
                     self.current_image = self.scaled_gif_frames[self.current_gif_frame]
                     self.last_gif_update = current_time
+                    if self.current_gif_frame == 0:
+                        self.gif_loop_done = True
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -683,24 +802,24 @@ class InstantSlideshow:
                         self.dragging = False
                         self.pending_drag = False
 
-                        if close_hit_rect.collidepoint(event.pos):
+                        if self.close_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'close'
-                        elif folder_hit_rect.collidepoint(event.pos):
+                        elif self.folder_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'folder'
-                        elif media_hit_rect.collidepoint(event.pos):
+                        elif self.media_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'media'
-                        elif trash_hit_rect.collidepoint(event.pos):
+                        elif self.trash_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'trash'
                             self.pending_delete_index = self.current_index
-                        elif back_hit_rect.collidepoint(event.pos):
+                        elif self.back_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'back'
-                        elif plus_hit_rect.collidepoint(event.pos):
+                        elif self.plus_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'plus'
-                        elif minus_hit_rect.collidepoint(event.pos):
+                        elif self.minus_hit_rect.collidepoint(event.pos):
                             self.pressed_control = 'minus'
                         # Check if clicking in title bar area (top 50px)
-                        elif event.pos[1] < header_h:
-                            if not dur_control_hit_rect.collidepoint(event.pos): # Don't drag if clicking duration
+                        elif event.pos[1] < self.header_h:
+                            if not self.dur_control_hit_rect.collidepoint(event.pos): # Don't drag if clicking duration
                                 self.pending_drag = True
                                 self.drag_start_pos = event.pos
                                 self.drag_offset_x = event.pos[0]
@@ -712,12 +831,12 @@ class InstantSlideshow:
                     elif event.button == 3: # Right Click
                         self.next_image()
                     elif event.button == 4: # Scroll Up
-                        if dur_control_rect.collidepoint(event.pos):
+                        if self.dur_control_rect.collidepoint(event.pos):
                             self.slide_duration = min(self.slide_duration + 1000, 3600000)
                         else:
                             self.prev_image()
                     elif event.button == 5: # Scroll Down
-                        if dur_control_rect.collidepoint(event.pos):
+                        if self.dur_control_rect.collidepoint(event.pos):
                             self.slide_duration = max(self.slide_duration - 1000, 1000)
                         else:
                             self.next_image()
@@ -725,20 +844,20 @@ class InstantSlideshow:
                 elif event.type == pygame.MOUSEBUTTONUP:
                     if event.button == 1:
                         if self.pressed_control and not self.dragging:
-                            if self.pressed_control == 'close' and close_hit_rect.collidepoint(event.pos):
+                            if self.pressed_control == 'close' and self.close_hit_rect.collidepoint(event.pos):
                                 self.running = False
-                            elif self.pressed_control == 'folder' and folder_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'folder' and self.folder_hit_rect.collidepoint(event.pos):
                                 self.open_current_folder()
-                            elif self.pressed_control == 'media' and media_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'media' and self.media_hit_rect.collidepoint(event.pos):
                                 self.open_current_media()
-                            elif self.pressed_control == 'trash' and trash_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'trash' and self.trash_hit_rect.collidepoint(event.pos):
                                 self.delete_image_at(self.pending_delete_index)
-                            elif self.pressed_control == 'back' and back_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'back' and self.back_hit_rect.collidepoint(event.pos):
                                 self.next_action = 'picker'
                                 self.running = False
-                            elif self.pressed_control == 'plus' and plus_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'plus' and self.plus_hit_rect.collidepoint(event.pos):
                                 self.slide_duration = min(self.slide_duration + 1000, 3600000)
-                            elif self.pressed_control == 'minus' and minus_hit_rect.collidepoint(event.pos):
+                            elif self.pressed_control == 'minus' and self.minus_hit_rect.collidepoint(event.pos):
                                 self.slide_duration = max(self.slide_duration - 1000, 1000)
 
                         self.pressed_control = None
@@ -766,77 +885,7 @@ class InstantSlideshow:
                 err_surf = self.font_cjk.render("Could not load image", True, (255, 255, 255))
                 self.display_surface.blit(err_surf, err_surf.get_rect(center=(self.width // 2, self.height // 2)))
 
-            header_surf = pygame.Surface((self.display_surface.get_width(), header_h), pygame.SRCALPHA)
-            header_surf.fill((0, 0, 0, 180))
-            self.display_surface.blit(header_surf, (0, 0))
-
-            if hasattr(self, 'caption_text'):
-                display_text = self.caption_text
-                if self.paused:
-                    display_text += " [PAUSED]"
-                self.draw_text_mixed(self.display_surface, display_text, (15, 15), (0, 255, 0))
-
-            mouse_pos = pygame.mouse.get_pos()
-
-            close_color = (255, 80, 80) if close_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
-            draw_close_x(self.display_surface, close_rect, close_color)
-
-            folder_color = (100, 200, 255) if folder_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
-            pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 3, 9, 4))
-            pygame.draw.rect(self.display_surface, folder_color, (folder_rect.left + 2, folder_rect.top + 7, 20, 13))
-
-            media_color = (100, 255, 100) if media_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
-            pygame.draw.rect(self.display_surface, media_color, (media_rect.left + 2, media_rect.top + 4, 20, 16), 2)
-            pygame.draw.circle(self.display_surface, media_color, (media_rect.left + 8, media_rect.top + 9), 2)
-            pygame.draw.line(self.display_surface, media_color, (media_rect.left + 4, media_rect.bottom - 6), (media_rect.left + 10, media_rect.bottom - 12), 2)
-            pygame.draw.line(self.display_surface, media_color, (media_rect.left + 10, media_rect.bottom - 12), (media_rect.right - 4, media_rect.bottom - 6), 2)
-
-            back_color = (255, 200, 100) if back_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
-            bl, bt = back_rect.left, back_rect.top
-            pygame.draw.polygon(self.display_surface, back_color, [
-                (back_rect.centerx, bt + 3),
-                (bl + 3, bt + 11),
-                (back_rect.right - 3, bt + 11),
-            ], 2)
-            body = pygame.Rect(bl + 5, bt + 11, back_rect.width - 10, back_rect.height - 14)
-            pygame.draw.rect(self.display_surface, back_color, body, 2)
-            pygame.draw.rect(self.display_surface, back_color, pygame.Rect(back_rect.centerx - 2, body.bottom - 6, 4, 6), 2)
-
-            is_trash_hover = trash_hit_rect.collidepoint(mouse_pos)
-            is_trash_pressed = self.pressed_control == 'trash' and is_trash_hover
-            if is_trash_pressed:
-                pygame.draw.rect(self.display_surface, (90, 25, 25), trash_rect.inflate(6, 6), border_radius=4)
-                trash_color = (255, 60, 60)
-            elif is_trash_hover:
-                trash_color = (255, 90, 90)
-            else:
-                trash_color = (200, 120, 120)
-            tl, tt = trash_rect.left, trash_rect.top
-            pygame.draw.rect(self.display_surface, trash_color, (tl + 9, tt + 3, 6, 2))
-            pygame.draw.rect(self.display_surface, trash_color, (tl + 4, tt + 6, 16, 2))
-            pygame.draw.rect(self.display_surface, trash_color, (tl + 6, tt + 9, 12, 12), 2)
-            pygame.draw.line(self.display_surface, trash_color, (tl + 10, tt + 12), (tl + 10, tt + 18), 2)
-            pygame.draw.line(self.display_surface, trash_color, (tl + 14, tt + 12), (tl + 14, tt + 18), 2)
-
-            is_minus_hover = minus_hit_rect.collidepoint(mouse_pos)
-            is_plus_hover = plus_hit_rect.collidepoint(mouse_pos)
-            dur_color = (255, 255, 255) if dur_control_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
-            btn_hi = (255, 255, 255)
-            btn_lo = (150, 150, 150)
-
-            minus_color = btn_hi if is_minus_hover else btn_lo
-            pygame.draw.line(self.display_surface, minus_color, (minus_rect.left + 5, minus_rect.centery), (minus_rect.right - 5, minus_rect.centery), 2)
-
-            plus_color = btn_hi if is_plus_hover else btn_lo
-            pygame.draw.line(self.display_surface, plus_color, (plus_rect.left + 5, plus_rect.centery), (plus_rect.right - 5, plus_rect.centery), 2)
-            pygame.draw.line(self.display_surface, plus_color, (plus_rect.centerx, plus_rect.top + 5), (plus_rect.centerx, plus_rect.bottom - 5), 2)
-
-            dur_str = f"{self.slide_duration/1000:.1f}s"
-            try:
-                text_surf = dur_font.render(dur_str, True, dur_color)
-                self.display_surface.blit(text_surf, text_surf.get_rect(center=dur_text_rect.center))
-            except Exception as e:
-                print(f"dur render failed: {e}")
+            self._draw_header()
 
             pygame.display.flip()
             self.clock.tick(30)
