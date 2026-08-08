@@ -9,6 +9,7 @@ A lightweight, borderless image slideshow viewer written in Python using Pygame.
 *   **Smart Rendering:** Borderless window, automatic scaling, and centering.
 *   **Font Support:** Handles filenames with CJK (Chinese/Japanese/Korean) characters and Emojis.
 *   **Modern UI:** Minimalist overlay with transparent title bar, close button, "Open Folder", and "Open Media" buttons.
+*   **Resume Session:** Remembers position and shuffle order per list — continue exactly where you left off via `--last` or the picker's Continue button.
 *   **Controls:** Keyboard and Mouse navigation.
 
 ## Installation
@@ -49,6 +50,15 @@ Specify the sort order using the `-s` flag. Options: `random` (default), `name`.
 ```bash
 python slideshow.py "C:\path\to\list.txt" -s name
 ```
+
+### 5. Continue Last Session
+Resume the most recent slideshow exactly where you left off: same list, saved duration/sort, same shuffled order, and the slide you were last viewing.
+
+```bash
+python slideshow.py --last
+```
+
+Or click the **Continue** button in the picker window. The current slide and shuffle order are saved per list in `recents.json` whenever the slideshow exits (Esc, close button, or back button). Opening a list normally (picker row, Browse, or an explicit file argument) starts it fresh. `-d`/`-s` can be combined with `--last` to override the saved settings.
 
 ## Controls
 

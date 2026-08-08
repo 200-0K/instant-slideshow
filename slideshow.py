@@ -54,6 +54,8 @@ def load_recents():
                         'last_used': item.get('last_used', ''),
                         'duration': int(item.get('duration', 30)),
                         'sort': item.get('sort', 'random'),
+                        'seed': item.get('seed'),
+                        'last_image': item.get('last_image'),
                     })
             return cleaned
     except Exception as e:
@@ -84,7 +86,7 @@ def load_local_font(size):
     return None
 
 
-def add_recent(path, duration, sort_order):
+def add_recent(path, duration, sort_order, seed=None, last_image=None):
     """Add or update a recent entry, moving it to the top."""
     path = os.path.abspath(path)
     recents = load_recents()
@@ -94,7 +96,23 @@ def add_recent(path, duration, sort_order):
         'last_used': datetime.now().isoformat(timespec='seconds'),
         'duration': int(duration),
         'sort': sort_order,
+        'seed': seed,
+        'last_image': last_image,
     })
+    save_recents(recents)
+
+
+def save_session_state(path, duration, sort_order, seed, last_image):
+    """Update the session state of an existing recent entry, in place."""
+    apath = os.path.abspath(path)
+    recents = load_recents()
+    entry = next((r for r in recents if os.path.abspath(r['path']) == apath), None)
+    if entry is None:
+        return
+    entry['duration'] = int(duration)
+    entry['sort'] = sort_order
+    entry['seed'] = seed
+    entry['last_image'] = last_image
     save_recents(recents)
 
 init(autoreset=True)
@@ -107,10 +125,12 @@ class POINT(ctypes.Structure):
 pygame.init()
 
 class InstantSlideshow:
-    def __init__(self, file_path=None, duration=None, sort_order=None):
+    def __init__(self, file_path=None, duration=None, sort_order=None, start_image=None, seed=None):
         self.file_path_arg = file_path
         self.duration_arg = duration
         self.sort_order_arg = sort_order
+        self.start_image = start_image
+        self.seed = seed
         
         self.image_paths = []
         self.current_index = 0
@@ -188,15 +208,24 @@ class InstantSlideshow:
         self.get_slide_duration()
         self.get_sort_order()
 
-        if hasattr(self, 'selected_file_path'):
-            add_recent(self.selected_file_path, self.slide_duration / 1000, self.sort_order)
-
         if self.sort_order == 'name':
             print(f"{Fore.MAGENTA}Sorting playlist by name...")
             self.image_paths.sort(key=lambda x: x.lower())
+            self.seed = None
         else:
-            print(f"{Fore.MAGENTA}Shuffling playlist...")
-            random.shuffle(self.image_paths)
+            if self.seed is None:
+                self.seed = random.randrange(2**31)
+            print(f"{Fore.MAGENTA}Shuffling playlist (seed {self.seed})...")
+            random.Random(self.seed).shuffle(self.image_paths)
+
+        # current_index defaults to 0; jump to the saved slide when resuming
+        if self.start_image in self.image_paths:
+            self.current_index = self.image_paths.index(self.start_image)
+            print(f"{Fore.CYAN}Resuming at slide {Style.BRIGHT}{self.current_index + 1}/{len(self.image_paths)}")
+
+        if hasattr(self, 'selected_file_path'):
+            add_recent(self.selected_file_path, self.slide_duration / 1000, self.sort_order,
+                       seed=self.seed, last_image=self.start_image)
 
         self.setup_window()
         self.load_current_image()
@@ -576,6 +605,15 @@ class InstantSlideshow:
             self.sort_order = 'random'
         print(f"{Fore.CYAN}Sort order set to {Style.BRIGHT}{self.sort_order}")
 
+    def _save_session_state(self):
+        if not hasattr(self, 'selected_file_path') or not self.image_paths:
+            return
+        last_image = None
+        if 0 <= self.current_index < len(self.image_paths):
+            last_image = self.image_paths[self.current_index]
+        save_session_state(self.selected_file_path, self.slide_duration / 1000,
+                           self.sort_order, self.seed, last_image)
+
     def run(self):
         width = self.display_surface.get_width()
         header_h = 50
@@ -803,6 +841,8 @@ class InstantSlideshow:
             pygame.display.flip()
             self.clock.tick(30)
 
+        self._save_session_state()
+
 class FilePicker:
     """Compact pygame picker for selecting a slideshow list from recents."""
 
@@ -847,6 +887,7 @@ class FilePicker:
 
         # Precompute constant rects (picker size never changes)
         self._close_rect_cache = pygame.Rect(self.width - 28, 6, 22, 22)
+        self._continue_rect_cache = pygame.Rect(self._close_rect_cache.left - 8 - 96, 6, 96, 22)
         y = self.controls_y
         browse = pygame.Rect(10, y, 92, 28)
         minus = pygame.Rect(browse.right + 18, y, 22, 28)
@@ -877,6 +918,16 @@ class FilePicker:
 
     def _close_rect(self):
         return self._close_rect_cache
+
+    def _continue_rect(self):
+        return self._continue_rect_cache
+
+    def _continue_entry(self):
+        """First recent whose list file still exists, or None."""
+        for entry, exists in zip(self.recents, self._existence):
+            if exists:
+                return entry
+        return None
 
     def _controls_rects(self):
         return self._controls
@@ -912,8 +963,17 @@ class FilePicker:
     def _browse(self):
         path = self._open_file_dialog()
         if path:
-            self.result = (path, self.duration, self.sort_order)
+            self.result = (path, self.duration, self.sort_order, False)
             self.running = False
+
+    def _launch(self, entry, resume):
+        self.result = (entry['path'], entry.get('duration', 30), entry.get('sort', 'random'), resume)
+        self.running = False
+
+    def _continue_last(self):
+        entry = self._continue_entry()
+        if entry:
+            self._launch(entry, True)
 
     @staticmethod
     def _open_file_dialog():
@@ -974,8 +1034,7 @@ class FilePicker:
         if not self._existence[idx]:
             self._remove_recent(idx)
             return
-        self.result = (entry['path'], entry.get('duration', 30), entry.get('sort', 'random'))
-        self.running = False
+        self._launch(entry, False)
 
     def _handle_events(self):
         mouse_pos = pygame.mouse.get_pos()
@@ -1008,6 +1067,8 @@ class FilePicker:
 
                     if close.collidepoint(event.pos):
                         self.pressed = ('close',)
+                    elif self._continue_rect().collidepoint(event.pos):
+                        self.pressed = ('continue',)
                     elif browse.collidepoint(event.pos):
                         self.pressed = ('browse',)
                     elif minus.collidepoint(event.pos):
@@ -1038,6 +1099,9 @@ class FilePicker:
                     kind = self.pressed[0]
                     if kind == 'close' and self._close_rect().collidepoint(event.pos):
                         self.running = False
+                    elif kind == 'continue':
+                        if self._continue_rect().collidepoint(event.pos):
+                            self._continue_last()
                     elif kind == 'browse':
                         browse, *_ = self._controls_rects()
                         if browse.collidepoint(event.pos):
@@ -1115,6 +1179,28 @@ class FilePicker:
         cc = self.CLOSE_HOVER if close_hover else self.TEXT_DIM
         draw_close_x(self.surface, close, cc)
 
+        # Continue button (resume most recent existing list)
+        cont = self._continue_rect()
+        cont_entry = self._continue_entry()
+        cont_enabled = cont_entry is not None
+        cont_hover = cont_enabled and cont.collidepoint(mouse_pos)
+        pygame.draw.rect(self.surface, self.ROW_HOVER if cont_hover else self.PANEL, cont, border_radius=4)
+        pygame.draw.rect(self.surface, self.BORDER, cont, 1, border_radius=4)
+        if not cont_enabled:
+            cont_color = self.TEXT_MISSING
+        elif cont_hover:
+            cont_color = self.ACCENT
+        else:
+            cont_color = self.TEXT
+        tri_cx = cont.left + 14
+        pygame.draw.polygon(self.surface, cont_color, [
+            (tri_cx - 3, cont.centery - 5),
+            (tri_cx - 3, cont.centery + 5),
+            (tri_cx + 5, cont.centery),
+        ])
+        ctxt = self.font.render("Continue", True, cont_color)
+        self.surface.blit(ctxt, ctxt.get_rect(midleft=(tri_cx + 10, cont.centery)))
+
         # Rows
         if not self.recents:
             msg = self.font.render("No recent lists. Click Browse to select one.", True, self.TEXT_DIM)
@@ -1189,6 +1275,13 @@ class FilePicker:
                 meta = f"last used: {entry['last_used']} | saved: {entry.get('duration', 30)}s {entry.get('sort', 'random')}"
                 mtxt = self.font_small.render(self._truncate(meta, self.width - 20, self.font_small), True, self.TEXT_DIM)
                 self.surface.blit(mtxt, (10, hint_rect.top + 22))
+        elif cont_hover:
+            name = os.path.basename(cont_entry['path']) or cont_entry['path']
+            hint = self.font_small.render(
+                self._truncate(f"Resume where you left off: {name}", self.width - 20, self.font_small),
+                True, self.TEXT_DIM,
+            )
+            self.surface.blit(hint, (10, hint_rect.top + 6))
         else:
             hint = self.font_small.render(
                 "Click a list to launch with its saved settings. Browse uses the settings below.",
@@ -1205,17 +1298,42 @@ class FilePicker:
         return self.result
 
 
+def find_resumable_entry(path=None):
+    """Return the recents entry for path, or the first entry whose file exists if path is None."""
+    recents = load_recents()
+    if path is None:
+        return next((r for r in recents if os.path.exists(r['path'])), None)
+    apath = os.path.abspath(path)
+    return next((r for r in recents if os.path.abspath(r['path']) == apath), None)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Instant Slideshow from a text file of paths.")
     parser.add_argument("file", nargs="?", help="Path to the text file containing image paths")
     parser.add_argument("-d", "--duration", type=float, help="Slide duration in seconds")
     parser.add_argument("-s", "--sort", choices=['random', 'name'], help="Sort order: random (default) or name")
+    parser.add_argument("--last", action="store_true",
+                        help="Continue the most recent slideshow, resuming where you left off")
 
     args = parser.parse_args()
 
     file_path = args.file
     duration = args.duration
     sort_order = args.sort
+    resume = False
+
+    if args.last and not file_path:
+        entry = find_resumable_entry()
+        if entry:
+            file_path = entry['path']
+            if duration is None:
+                duration = entry.get('duration', 30)
+            if sort_order is None:
+                sort_order = entry.get('sort', 'random')
+            resume = True
+            print(f"{Fore.CYAN}Continuing last slideshow: {Style.BRIGHT}{file_path}")
+        else:
+            print(f"{Fore.YELLOW}No recent lists to continue. Falling back to picker.")
 
     try:
         while True:
@@ -1224,13 +1342,23 @@ if __name__ == "__main__":
                 if not picker_result:
                     print(f"{Fore.YELLOW}No list selected. Exiting.")
                     break
-                file_path, duration, sort_order = picker_result
+                file_path, duration, sort_order, resume = picker_result
 
-            slideshow = InstantSlideshow(file_path=file_path, duration=duration, sort_order=sort_order)
+            start_image = None
+            seed = None
+            if resume:
+                entry = find_resumable_entry(file_path)
+                if entry:
+                    start_image = entry.get('last_image')
+                    seed = entry.get('seed')
+
+            slideshow = InstantSlideshow(file_path=file_path, duration=duration, sort_order=sort_order,
+                                         start_image=start_image, seed=seed)
             if slideshow.next_action == 'picker':
                 file_path = None
                 duration = None
                 sort_order = None
+                resume = False
                 continue
             break
     finally:
