@@ -9,7 +9,7 @@ A lightweight, borderless image slideshow viewer written in Python using Pygame.
 *   **Smart Rendering:** Borderless window, automatic scaling, and centering.
 *   **Font Support:** Handles filenames with CJK (Chinese/Japanese/Korean) characters and Emojis.
 *   **Modern UI:** Minimalist overlay with transparent title bar, close button, "Open Folder", and "Open Media" buttons.
-*   **Resume Session:** Remembers position and shuffle order per list — continue exactly where you left off via `--last` or the picker's Continue button.
+*   **Resume Session:** Remembers position and shuffle order per list. Continue exactly where you left off via `--last`, the picker's Continue button, or by clicking any recent list in the rich recent menu.
 *   **Controls:** Keyboard and Mouse navigation.
 
 ## Installation
@@ -45,20 +45,20 @@ python slideshow.py "C:\path\to\list.txt" -d 5
 ```
 
 ### 4. Sort Order
-Specify the sort order using the `-s` flag. Options: `random` (default), `name`.
+Specify the sort order using the `-s` flag. Options: `random` (default), `name`, or `file` (keeps the order of the list file).
 
 ```bash
 python slideshow.py "C:\path\to\list.txt" -s name
 ```
 
-### 5. Continue Last Session
-Resume the most recent slideshow exactly where you left off: same list, saved duration/sort, same shuffled order, and the slide you were last viewing.
+### 5. Continue a Session
+Resume any recent slideshow exactly where you left off: same list, saved duration/sort, same shuffled order, and the slide you were last viewing.
 
 ```bash
 python slideshow.py --last
 ```
 
-Or click the **Continue** button in the picker window. The current slide and shuffle order are saved per list in `recents.json` whenever the slideshow exits (Esc, close button, or back button). Opening a list normally (picker row, Browse, or an explicit file argument) starts it fresh. `-d`/`-s` can be combined with `--last` to override the saved settings.
+Or open the picker: the **Recent** list shows each saved slideshow with its filename, where you stopped (`42/1500 (3%)`), duration, sort order, and how long ago it was used. Click a row to resume it, or click the restart icon on the right to start that list fresh. The header **Continue** button is a shortcut for the most recent list. The current slide and shuffle order are saved per list and sort order in `recents.json` whenever the slideshow exits (Esc, close button, or back button). `-d`/`-s` can be combined with `--last` to override the saved settings.
 
 ## Controls
 

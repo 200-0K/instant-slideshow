@@ -57,6 +57,8 @@ def load_recents():
                         'sort': item.get('sort', 'random'),
                         'seed': item.get('seed'),
                         'last_image': item.get('last_image'),
+                        'last_index': item.get('last_index'),
+                        'total': item.get('total'),
                     })
             return cleaned
     except Exception as e:
@@ -77,6 +79,28 @@ def draw_close_x(surface, rect, color, pad=6, width=2):
     pygame.draw.line(surface, color, (rect.left + pad, rect.bottom - pad), (rect.right - pad, rect.top + pad), width)
 
 
+def _same_session(entry, path, sort=None):
+    """Check whether a recents entry matches the given path and optional sort."""
+    if os.path.abspath(entry['path']) != os.path.abspath(path):
+        return False
+    if sort is not None and entry.get('sort', 'random') != sort:
+        return False
+    return True
+
+
+def draw_tooltip(surface, font, mouse_pos, text, width, height):
+    """Draw a small tooltip near the cursor, clamped to the given surface size."""
+    pad = 6
+    tooltip_surf = font.render(text, True, (255, 255, 255))
+    tw, th = tooltip_surf.get_size()
+    rect = pygame.Rect(mouse_pos[0] + 12, mouse_pos[1] + 12, tw + pad * 2, th + pad * 2)
+    rect.right = min(rect.right, width - 4)
+    rect.bottom = min(rect.bottom, height - 4)
+    pygame.draw.rect(surface, (30, 30, 36), rect, border_radius=4)
+    pygame.draw.rect(surface, (70, 70, 80), rect, 1, border_radius=4)
+    surface.blit(tooltip_surf, (rect.left + pad, rect.top + pad))
+
+
 def load_local_font(size):
     path = os.path.join(SCRIPT_DIR, 'fonts', 'Noto_Sans', 'NotoSans-Regular.ttf')
     if os.path.exists(path):
@@ -87,11 +111,11 @@ def load_local_font(size):
     return None
 
 
-def add_recent(path, duration, sort_order, seed=None, last_image=None):
-    """Add or update a recent entry, moving it to the top."""
+def add_recent(path, duration, sort_order, seed=None, last_image=None, last_index=None, total=None):
+    '''Add or update a recent entry, moving it to the top.'''
     path = os.path.abspath(path)
     recents = load_recents()
-    recents = [r for r in recents if os.path.abspath(r['path']) != path]
+    recents = [r for r in recents if not _same_session(r, path, sort_order)]
     recents.insert(0, {
         'path': path,
         'last_used': datetime.now().isoformat(timespec='seconds'),
@@ -99,21 +123,24 @@ def add_recent(path, duration, sort_order, seed=None, last_image=None):
         'sort': sort_order,
         'seed': seed,
         'last_image': last_image,
+        'last_index': last_index,
+        'total': total,
     })
     save_recents(recents)
 
 
-def save_session_state(path, duration, sort_order, seed, last_image):
-    """Update the session state of an existing recent entry, in place."""
-    apath = os.path.abspath(path)
+def save_session_state(path, duration, sort_order, seed, last_image, last_index=None, total=None):
+    '''Update the session state of an existing recent entry, in place.'''
     recents = load_recents()
-    entry = next((r for r in recents if os.path.abspath(r['path']) == apath), None)
+    entry = next((r for r in recents if _same_session(r, path, sort_order)), None)
     if entry is None:
         return
     entry['duration'] = int(duration)
     entry['sort'] = sort_order
     entry['seed'] = seed
     entry['last_image'] = last_image
+    entry['last_index'] = last_index
+    entry['total'] = total
     save_recents(recents)
 
 init(autoreset=True)
@@ -219,6 +246,9 @@ class InstantSlideshow:
             print(f"{Fore.MAGENTA}Sorting playlist by name...")
             self.image_paths.sort(key=lambda x: x.lower())
             self.seed = None
+        elif self.sort_order == 'file':
+            print(f"{Fore.MAGENTA}Keeping playlist in file order...")
+            self.seed = None
         else:
             if self.seed is None:
                 self.seed = random.randrange(2**31)
@@ -232,7 +262,8 @@ class InstantSlideshow:
 
         if hasattr(self, 'selected_file_path'):
             add_recent(self.selected_file_path, self.slide_duration / 1000, self.sort_order,
-                       seed=self.seed, last_image=self.start_image)
+                       seed=self.seed, last_image=self.start_image,
+                       last_index=self.current_index, total=len(self.image_paths))
 
         self.setup_window()
         self.load_current_image()
@@ -360,6 +391,7 @@ class InstantSlideshow:
         self.dur_control_hit_rect = self.dur_control_rect.inflate(hit_padding, hit_padding)
 
         self.dur_font = self.font_local if self.font_local else self.font_cjk
+        self.tooltip_font = load_local_font(11) or pygame.font.SysFont('arial', 11)
 
     def load_current_image(self):
         if not self.image_paths:
@@ -696,6 +728,27 @@ class InstantSlideshow:
         except Exception as e:
             print(f"dur render failed: {e}")
 
+        # Control tooltips
+        tooltip = None
+        if self.close_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Close'
+        elif self.folder_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Open folder'
+        elif self.media_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Open image'
+        elif self.trash_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Move to trash'
+        elif self.back_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Back to picker'
+        elif self.plus_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Increase duration'
+        elif self.minus_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Decrease duration'
+        elif self.dur_control_hit_rect.collidepoint(mouse_pos):
+            tooltip = 'Scroll to adjust duration'
+        if tooltip:
+            draw_tooltip(self.display_surface, self.tooltip_font, mouse_pos, tooltip, self.width, self.height)
+
     def delete_image_at(self, idx):
         if not self.image_paths or idx < 0 or idx >= len(self.image_paths):
             return
@@ -741,11 +794,13 @@ class InstantSlideshow:
             print(f"{Fore.CYAN}Using default sort order: {Style.BRIGHT}random")
             return
 
-        print(f"{Fore.GREEN}Enter sort order (random/name) [default: random]:")
+        print(f"{Fore.GREEN}Enter sort order (random/name/file) [default: random]:")
         user_input = input(f"{Fore.YELLOW}Sort: {Style.RESET_ALL}").strip().lower()
         
         if user_input.startswith('n'):
             self.sort_order = 'name'
+        elif user_input.startswith('f'):
+            self.sort_order = 'file'
         else:
             self.sort_order = 'random'
         print(f"{Fore.CYAN}Sort order set to {Style.BRIGHT}{self.sort_order}")
@@ -757,7 +812,8 @@ class InstantSlideshow:
         if 0 <= self.current_index < len(self.image_paths):
             last_image = self.image_paths[self.current_index]
         save_session_state(self.selected_file_path, self.slide_duration / 1000,
-                           self.sort_order, self.seed, last_image)
+                           self.sort_order, self.seed, last_image,
+                           self.current_index, len(self.image_paths))
 
     def run(self):
         while self.running:
@@ -890,6 +946,28 @@ class InstantSlideshow:
 
         self._save_session_state()
 
+def _format_ago(iso):
+    '''Return a friendly relative-time string from an ISO-8601 timestamp.'''
+    if not iso:
+        return ''
+    try:
+        then = datetime.fromisoformat(iso)
+        delta = datetime.now() - then
+    except Exception:
+        return ''
+    seconds = max(0, int(delta.total_seconds()))
+    if seconds < 60:
+        return 'just now'
+    if seconds < 3600:
+        return f'{seconds // 60}m ago'
+    if seconds < 86400:
+        return f'{seconds // 3600}h ago'
+    if seconds < 2592000:
+        return f'{seconds // 86400}d ago'
+    return then.strftime('%Y-%m-%d')
+
+
+
 class FilePicker:
     """Compact pygame picker for selecting a slideshow list from recents."""
 
@@ -907,7 +985,7 @@ class FilePicker:
 
     def __init__(self):
         self.width = 420
-        self.height = 400
+        self.height = 420
         os.environ['SDL_VIDEO_CENTERED'] = '1'
         self.surface = pygame.display.set_mode((self.width, self.height), pygame.NOFRAME)
         pygame.display.set_caption("Instant Slideshow - Select List")
@@ -924,8 +1002,8 @@ class FilePicker:
         self.sort_order = 'random'
 
         self.header_h = 34
-        self.row_h = 26
-        self.rows_max = 10
+        self.row_h = 40
+        self.rows_max = 7
         self.rows_y = self.header_h + 4
         self.rows_area = pygame.Rect(0, self.rows_y, self.width, self.row_h * self.rows_max)
         self.controls_y = self.rows_area.bottom + 8
@@ -945,6 +1023,8 @@ class FilePicker:
 
         self.hover_row = -1
         self.hover_remove_row = -1
+        self.hover_restart_row = -1
+        self.tooltip_text = None
         self.pressed = None
 
         self.dragging = False
@@ -963,6 +1043,24 @@ class FilePicker:
         r = self._row_rect(visible_idx)
         return pygame.Rect(r.right - 22, r.top + (r.height - 16) // 2, 16, 16)
 
+    def _restart_rect(self, visible_idx):
+        r = self._row_rect(visible_idx)
+        rm = self._remove_rect(visible_idx)
+        return pygame.Rect(rm.left - 22, r.top + (r.height - 16) // 2, 16, 16)
+
+    def _draw_restart_icon(self, surface, rect, color):
+        cx, cy = rect.center
+        r = min(rect.width, rect.height) // 2 - 2
+        rect_arc = pygame.Rect(cx - r, cy - r, r * 2, r * 2)
+        pygame.draw.arc(surface, color, rect_arc, math.radians(60), math.radians(300), 2)
+        tip_x = cx + r
+        tip_y = cy
+        pygame.draw.polygon(surface, color, [
+            (tip_x, tip_y),
+            (tip_x - 5, tip_y - 3),
+            (tip_x - 5, tip_y + 3),
+        ])
+
     def _close_rect(self):
         return self._close_rect_cache
 
@@ -975,6 +1073,32 @@ class FilePicker:
             if exists:
                 return entry
         return None
+
+    def _row_meta(self, entry):
+        '''Build the small info line for a recent entry.'''
+        last_image = entry.get('last_image')
+        last_index = entry.get('last_index')
+        total = entry.get('total')
+        parts = []
+        if last_image is None:
+            if total:
+                parts.append(f'{total} images')
+            parts.append('not started')
+        elif last_index is not None and total:
+            pct = int(round(last_index / total * 100))
+            parts.append(f'stopped at {last_index + 1}/{total} ({pct}%)')
+        elif total:
+            parts.append(f'{total} images')
+        dur = entry.get('duration')
+        if dur is not None:
+            parts.append(f'{dur}s')
+        sort = entry.get('sort')
+        if sort:
+            parts.append(sort)
+        ago = _format_ago(entry.get('last_used'))
+        if ago:
+            parts.append(ago)
+        return ' • '.join(parts) if parts else ''
 
     def _controls_rects(self):
         return self._controls
@@ -1074,7 +1198,7 @@ class FilePicker:
             if self.scroll_offset > max_scroll:
                 self.scroll_offset = max_scroll
 
-    def _select_recent(self, idx):
+    def _restart_recent(self, idx):
         if not (0 <= idx < len(self.recents)):
             return
         entry = self.recents[idx]
@@ -1083,17 +1207,53 @@ class FilePicker:
             return
         self._launch(entry, False)
 
-    def _handle_events(self):
-        mouse_pos = pygame.mouse.get_pos()
-        self.hover_row = -1
-        self.hover_remove_row = -1
+    def _select_recent(self, idx):
+        if not (0 <= idx < len(self.recents)):
+            return
+        entry = self.recents[idx]
+        if not self._existence[idx]:
+            self._remove_recent(idx)
+            return
+        self._launch(entry, True)
+
+    def _update_tooltip(self, mouse_pos):
         if self.rows_area.collidepoint(mouse_pos):
             for vi, ri, _ in self._visible_recents():
                 if self._row_rect(vi).collidepoint(mouse_pos):
                     self.hover_row = ri
-                    if self._remove_rect(vi).collidepoint(mouse_pos):
+                    if self._restart_rect(vi).collidepoint(mouse_pos):
+                        self.hover_restart_row = ri
+                        self.tooltip_text = 'Start fresh'
+                    elif self._remove_rect(vi).collidepoint(mouse_pos):
                         self.hover_remove_row = ri
-                    break
+                        self.tooltip_text = 'Remove from recents'
+                    return
+
+        if self.tooltip_text is not None:
+            return
+
+        if self._close_rect().collidepoint(mouse_pos):
+            self.tooltip_text = 'Close'
+        elif self._continue_rect().collidepoint(mouse_pos):
+            self.tooltip_text = 'Resume latest'
+        else:
+            browse, minus, _, plus, sort_btn = self._controls_rects()
+            if browse.collidepoint(mouse_pos):
+                self.tooltip_text = 'Browse for list'
+            elif minus.collidepoint(mouse_pos):
+                self.tooltip_text = 'Decrease duration'
+            elif plus.collidepoint(mouse_pos):
+                self.tooltip_text = 'Increase duration'
+            elif sort_btn.collidepoint(mouse_pos):
+                self.tooltip_text = f'Cycle sort order ({self.sort_order})'
+
+    def _handle_events(self):
+        mouse_pos = pygame.mouse.get_pos()
+        self.hover_row = -1
+        self.hover_remove_row = -1
+        self.hover_restart_row = -1
+        self.tooltip_text = None
+        self._update_tooltip(mouse_pos)
 
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
@@ -1123,7 +1283,9 @@ class FilePicker:
                     else:
                         vi, ri = self._pick_row_at(event.pos)
                         if ri >= 0:
-                            if self._remove_rect(vi).collidepoint(event.pos):
+                            if self._restart_rect(vi).collidepoint(event.pos):
+                                self.pressed = ('restart', ri)
+                            elif self._remove_rect(vi).collidepoint(event.pos):
                                 self.pressed = ('remove', ri)
                             else:
                                 self.pressed = ('row', ri)
@@ -1160,7 +1322,12 @@ class FilePicker:
                     elif kind == 'sort':
                         _, _, _, _, sort_btn = self._controls_rects()
                         if sort_btn.collidepoint(event.pos):
-                            self.sort_order = 'name' if self.sort_order == 'random' else 'random'
+                            self.sort_order = {'random': 'name', 'name': 'file', 'file': 'random'}[self.sort_order]
+                    elif kind == 'restart':
+                        idx = self.pressed[1]
+                        vi_candidate = idx - self.scroll_offset
+                        if 0 <= vi_candidate < self.rows_max and self._restart_rect(vi_candidate).collidepoint(event.pos):
+                            self._restart_recent(idx)
                     elif kind == 'remove':
                         idx = self.pressed[1]
                         vi_candidate = idx - self.scroll_offset
@@ -1259,11 +1426,21 @@ class FilePicker:
 
                 filename = os.path.basename(entry['path']) or entry['path']
                 color = self.TEXT if exists else self.TEXT_MISSING
-                text_max_w = row.width - 40
+                text_max_w = row.width - 62
                 filename_r = self.font.render(self._truncate(filename, text_max_w, self.font), True, color)
-                self.surface.blit(filename_r, (row.left + 10, row.top + (row.height - filename_r.get_height()) // 2))
+                self.surface.blit(filename_r, (row.left + 10, row.top + 6))
+
+                meta = self._row_meta(entry)
+                if meta:
+                    meta_r = self.font_small.render(self._truncate(meta, text_max_w, self.font_small), True, self.TEXT_DIM)
+                    self.surface.blit(meta_r, (row.left + 10, row.top + 22))
 
                 if is_hover:
+                    rst = self._restart_rect(vi)
+                    rst_hover = (ri == self.hover_restart_row)
+                    rcol = self.ACCENT if rst_hover else self.TEXT_DIM
+                    self._draw_restart_icon(self.surface, rst, rcol)
+
                     rm = self._remove_rect(vi)
                     rm_hover = (ri == self.hover_remove_row)
                     rc = self.CLOSE_HOVER if rm_hover else self.TEXT_DIM
@@ -1327,10 +1504,13 @@ class FilePicker:
             self.surface.blit(hint, (10, hint_rect.top + 6))
         else:
             hint = self.font_small.render(
-                "Click a list to launch with its saved settings. Browse uses the settings below.",
+                "Click a recent list to resume, or click the restart icon to start fresh. Browse uses the settings below.",
                 True, self.TEXT_DIM,
             )
             self.surface.blit(hint, (10, hint_rect.top + 6))
+
+        if self.tooltip_text:
+            draw_tooltip(self.surface, self.font_small, mouse_pos, self.tooltip_text, self.width, self.height)
 
     def run(self):
         while self.running:
@@ -1341,20 +1521,19 @@ class FilePicker:
         return self.result
 
 
-def find_resumable_entry(path=None):
-    """Return the recents entry for path, or the first entry whose file exists if path is None."""
+def find_resumable_entry(path=None, sort=None):
+    """Return the recents entry for path+sort, or the first entry whose file exists if path is None."""
     recents = load_recents()
     if path is None:
         return next((r for r in recents if os.path.exists(r['path'])), None)
-    apath = os.path.abspath(path)
-    return next((r for r in recents if os.path.abspath(r['path']) == apath), None)
+    return next((r for r in recents if _same_session(r, path, sort)), None)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Instant Slideshow from a text file of paths.")
     parser.add_argument("file", nargs="?", help="Path to the text file containing image paths")
     parser.add_argument("-d", "--duration", type=float, help="Slide duration in seconds")
-    parser.add_argument("-s", "--sort", choices=['random', 'name'], help="Sort order: random (default) or name")
+    parser.add_argument('-s', '--sort', choices=['random', 'name', 'file'], help='Sort order: random (default), name, or file (keep list order)')
     parser.add_argument("--last", action="store_true",
                         help="Continue the most recent slideshow, resuming where you left off")
 
@@ -1390,7 +1569,7 @@ if __name__ == "__main__":
             start_image = None
             seed = None
             if resume:
-                entry = find_resumable_entry(file_path)
+                entry = find_resumable_entry(file_path, sort_order)
                 if entry:
                     start_image = entry.get('last_image')
                     seed = entry.get('seed')
