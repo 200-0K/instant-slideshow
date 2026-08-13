@@ -5,7 +5,7 @@ A lightweight, borderless image slideshow viewer written in Python using Pygame.
 ## Features
 
 *   **Instant Start:** Reads paths directly from a text file (no pre-loading).
-*   **Format Support:** JPG, PNG, BMP, WEBP, and **Animated GIFs**.
+*   **Format Support:** JPG, PNG, BMP, WEBP, and **Animated GIFs** (streamed and prefetched in the background for near-instant playback).
 *   **Smart Rendering:** Borderless window, automatic scaling, and centering.
 *   **Font Support:** Handles filenames with CJK (Chinese/Japanese/Korean) characters and Emojis.
 *   **Modern UI:** Minimalist overlay with transparent title bar, close button, "Open Folder", and "Open Media" buttons.

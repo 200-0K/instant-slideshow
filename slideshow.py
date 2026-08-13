@@ -5,12 +5,43 @@ import json
 import random
 import ctypes
 import subprocess
+import threading
+import queue
 from datetime import datetime
 from PIL import Image
 import argparse
 import math
 from colorama import init, Fore, Style
 from send2trash import send2trash
+
+# --- Resampling filter compatibility (Pillow 8.x vs 9+) ----------------------
+try:
+    _LANCZOS = Image.Resampling.LANCZOS
+    _BILINEAR = Image.Resampling.BILINEAR
+except AttributeError:
+    _LANCZOS = getattr(Image, 'LANCZOS', getattr(Image, 'ANTIALIAS', Image.BICUBIC))
+    _BILINEAR = getattr(Image, 'BILINEAR', Image.LINEAR)
+
+# Milliseconds per tick to spend converting queued raw bytes into pygame
+# surfaces.  Keeps the main thread from starving the decoder with big
+# frombytes() copies while still staying well ahead of real-time playback.
+_CURRENT_DRAIN_MS = 6
+_PREFETCH_DRAIN_MS = 2
+
+# Bigger slice of the tick while the current slide has almost nothing decoded,
+# so the opening frames land at once instead of trickling in at 6ms/tick.
+_STARTUP_DRAIN_MS = 22
+_STARTUP_FRAMES = 8
+
+# Frames needed before a GIF starts animating.  Playback then chases the
+# decoder and holds the newest decoded frame if it catches up.  Frames rather
+# than milliseconds, because total duration isn't known until decode finishes.
+_GIF_START_FRAMES = 2
+
+# How long a slide may be decoding before the centred "Loading..." indicator
+# appears.  Short enough to catch a slow photo, long enough that quick ones
+# don't flash a spinner.
+_LOADER_DELAY_MS = 120
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, 'last_selected_list.txt')
@@ -152,6 +183,168 @@ class POINT(ctypes.Structure):
 
 pygame.init()
 
+
+class MediaLoadJob:
+    """Background decode/resize job for one image or animated GIF.
+
+    GIFs that will be upscaled are kept at native resolution in the worker and
+    only scaled once per displayed frame on the main thread.  GIFs that will be
+    downscaled are resized in the worker so memory stays bounded.  Statics are
+    resized to display size (one-off cost).  Raw RGBA bytes are pushed through
+    a queue; the main loop converts them to pygame surfaces on the main thread
+    because SDL surfaces are not thread-safe.
+    """
+
+    def __init__(self, path, native_size, display_size, is_gif, start_ticks):
+        self.path = path
+        self.native_size = native_size
+        self.display_size = display_size
+        self.display_w, self.display_h = display_size
+        self.is_gif = is_gif
+        self.start_ticks = start_ticks
+        # Frame count is discovered by the worker as it decodes.  Asking Pillow
+        # for n_frames walks the whole file and stalls the main thread, which
+        # is exactly the freeze we're trying to remove.
+        self.total_frames = None if is_gif else 1
+
+        # Only an UPSCALED GIF is kept at native size in the worker, so we scale
+        # once per displayed frame instead of storing giant frames.  Everything
+        # else - downscaled GIFs and all statics - is resized in the worker.
+        # (The old condition was `is_gif and display < native`, which silently
+        # sent every static down the native-size branch and blitted it
+        # unresized at the display-size offset: a zoomed top-left crop.)
+        if is_gif and display_size[0] >= native_size[0]:
+            self.worker_size = native_size
+        else:
+            self.worker_size = display_size
+        self.worker_w, self.worker_h = self.worker_size
+        self.needs_display_scale = (self.worker_size != display_size)
+
+        self.cancel_event = threading.Event()
+        self.queue = queue.Queue()
+        self.surfaces = []
+        self.durations = []
+        self.buffered_duration = 0
+
+        self.done = False
+        self.error = None
+        self.total_duration = 0
+        self.first_frame_ticks = None
+        self.done_ticks = None
+
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def _run(self):
+        try:
+            with Image.open(self.path) as im:
+                if self.is_gif:
+                    self._decode_gif(im)
+                else:
+                    self._decode_static(im)
+        except Exception as e:
+            self.queue.put(('error', str(e)))
+
+    def _decode_static(self, im):
+        # draft() lets JPEGs decode at a reduced DCT scale when we're
+        # downscaling anyway - roughly 2x faster on a large photo, and visually
+        # identical once LANCZOS runs. It's a no-op for formats that can't do
+        # it, and passing mode=None leaves the mode alone.
+        try:
+            im.draft(None, self.worker_size)
+        except Exception:
+            pass
+
+        frame = im
+        # Palette / bilevel / LA modes must be promoted before a smooth resize,
+        # or we'd interpolate palette indices instead of colours.
+        if frame.mode not in ('RGB', 'RGBA', 'L'):
+            frame = frame.convert('RGBA')
+        if frame.size != self.worker_size:
+            frame = frame.resize(self.worker_size, _LANCZOS)
+        frame = frame.convert('RGBA')
+
+        self.queue.put(('frame', frame.tobytes(), 0))
+        self.queue.put(('done', 1, 0))
+
+    def _decode_gif(self, im):
+        """Walk frames until EOF; the count is a by-product, not a prerequisite."""
+        total_duration = 0
+        count = 0
+        while True:
+            if self.cancel_event.is_set():
+                return
+            try:
+                im.seek(count)
+            except EOFError:
+                break
+
+            duration = im.info.get('duration', 100)
+            total_duration += duration
+
+            frame = im.convert('RGBA')
+            if frame.size != self.worker_size:
+                frame = frame.resize(self.worker_size, _BILINEAR)
+            self.queue.put(('frame', frame.tobytes(), duration))
+            count += 1
+
+        self.queue.put(('done', count, total_duration))
+
+    def drain(self, max_frames, max_ms=None):
+        """Convert queued raw frames into pygame surfaces.
+
+        Returns True if at least one new surface was produced.
+
+        `max_ms` time-boxes the work so the main thread doesn't starve the
+        decoder with big frombytes() copies.
+        """
+        added = 0
+        start = pygame.time.get_ticks()
+        while added < max_frames:
+            if max_ms is not None and pygame.time.get_ticks() - start >= max_ms:
+                break
+            try:
+                item = self.queue.get_nowait()
+            except queue.Empty:
+                break
+
+            kind = item[0]
+            if kind == 'frame':
+                _, data, duration = item
+                surf = pygame.image.frombytes(data, self.worker_size, 'RGBA')
+                # Convert to the display's pixel format.  Without this every
+                # blit has to reorder channels and alpha-blend in software,
+                # which costs ~20x more than the blit itself.
+                try:
+                    surf = surf.convert_alpha()
+                except pygame.error:
+                    pass  # display not ready; unconverted still renders
+                self.surfaces.append(surf)
+                self.durations.append(duration)
+                self.buffered_duration += duration
+                if self.first_frame_ticks is None:
+                    self.first_frame_ticks = pygame.time.get_ticks()
+                added += 1
+            elif kind == 'done':
+                _, self.total_frames, self.total_duration = item
+                self.done = True
+                self.done_ticks = pygame.time.get_ticks()
+            elif kind == 'error':
+                self.error = item[1]
+                self.done = True
+                self.done_ticks = pygame.time.get_ticks()
+        return added > 0
+
+    def cancel(self):
+        self.cancel_event.set()
+        # Drop queued raw data so the cancelled job releases memory quickly.
+        while True:
+            try:
+                self.queue.get_nowait()
+            except queue.Empty:
+                break
+
+
 class InstantSlideshow:
     def __init__(self, file_path=None, duration=None, sort_order=None, start_image=None, seed=None):
         self.file_path_arg = file_path
@@ -163,6 +356,8 @@ class InstantSlideshow:
         self.image_paths = []
         self.current_index = 0
         self.current_image = None
+        self.img_x = 0
+        self.img_y = 0
         self.display_surface = None
         self.clock = pygame.time.Clock()
         self.running = True
@@ -219,18 +414,31 @@ class InstantSlideshow:
         self.pending_delete_index = -1
         self.next_action = 'exit'  # set to 'picker' to return to the picker on exit
 
-        self.is_gif = False
-        self.pil_image = None
-        self.original_image = None
         self.caption_text = ""
-        self.gif_frames = []
+        self._caption_cache_key = None
+        self._caption_cache_surf = None
+        self._header_bg = None
+        self._dim_overlay = None
+
+        # Image / GIF playback state (updated from the active MediaLoadJob)
+        self.is_gif = False
         self.scaled_gif_frames = []
         self.gif_durations = []
         self.current_gif_frame = 0
         self.last_gif_update = 0
         self.gif_total_duration = 0
         self.gif_loop_done = True
-        self._show_load_spinner = False
+
+        # Upscale state: reuse one destination surface instead of allocating a
+        # fresh display-size surface for every frame we scale.
+        self._gif_display_size = None
+        self._last_displayed_frame = None
+        self._scaled_dest = None
+
+        # Async loading jobs.  current_job is what we are currently displaying
+        # (or about to display); prefetch_job warms up current_index + 1.
+        self.current_job = None
+        self.prefetch_job = None
 
         self.load_paths()
 
@@ -393,108 +601,274 @@ class InstantSlideshow:
         self.dur_font = self.font_local if self.font_local else self.font_cjk
         self.tooltip_font = load_local_font(11) or pygame.font.SysFont('arial', 11)
 
+    def _compute_target_size(self, src_size):
+        """Return the largest (width, height) that fits inside the window."""
+        img_w, img_h = src_size
+        win_w = self.display_surface.get_width()
+        win_h = self.display_surface.get_height()
+        ratio = min(win_w / img_w, win_h / img_h)
+        new_w = max(1, int(img_w * ratio))
+        new_h = max(1, int(img_h * ratio))
+        return new_w, new_h
+
+    def _cancel_jobs(self):
+        """Cancel any in-flight loading jobs and detach them."""
+        if self.current_job:
+            self.current_job.cancel()
+            self.current_job = None
+        if self.prefetch_job:
+            self.prefetch_job.cancel()
+            self.prefetch_job = None
+
+    def _start_prefetch(self):
+        """Begin decoding the next slide in the background."""
+        if not self.image_paths or len(self.image_paths) <= 1:
+            return
+        nxt = (self.current_index + 1) % len(self.image_paths)
+        path = self.image_paths[nxt]
+
+        # Header read only: is_animated seeks a single frame, which is cheap.
+        # n_frames is deliberately NOT touched here — it scans the whole file.
+        try:
+            with Image.open(path) as im:
+                is_gif = getattr(im, "is_animated", False)
+                native_size = im.size
+                display_size = self._compute_target_size(native_size)
+        except Exception:
+            return
+
+        if self.prefetch_job:
+            self.prefetch_job.cancel()
+        self.prefetch_job = MediaLoadJob(path, native_size, display_size,
+                                         is_gif, pygame.time.get_ticks())
+
+    def _activate_job(self, job):
+        """Point playback state at a job whose first frame has arrived."""
+        now = pygame.time.get_ticks()
+        win_w = self.display_surface.get_width()
+        win_h = self.display_surface.get_height()
+
+        self.img_x = (win_w - job.display_w) // 2
+        self.img_y = (win_h - job.display_h) // 2
+        self.is_gif = job.is_gif
+        self.scaled_gif_frames = job.surfaces
+        self.gif_durations = job.durations
+        self._gif_display_size = (job.display_size
+                                  if job.needs_display_scale else None)
+        self._last_displayed_frame = None
+        self._scaled_dest = None
+        self.current_gif_frame = 0
+        self.last_gif_update = now
+        self.last_switch_time = now
+
+        if job.surfaces:
+            self.current_image = self._gif_display_surface(0)
+
+        if job.is_gif:
+            self.gif_loop_done = False
+            self._update_gif_duration_estimate()
+        else:
+            self.gif_total_duration = 0
+            self.gif_loop_done = True
+
+    def _gif_display_surface(self, index):
+        """Return the current GIF frame scaled to display size when needed.
+
+        Caches the last scaled frame so we only scale once per displayed frame,
+        and reuses one destination surface so we aren't allocating a multi-MB
+        surface every tick during playback.
+        """
+        if (index == self._last_displayed_frame
+                and self.current_image is not None):
+            return self.current_image
+
+        surf = self.scaled_gif_frames[index]
+        if self._gif_display_size is not None:
+            if self._scaled_dest is None:
+                # Let smoothscale mint the destination on the first frame, then
+                # reuse it.  Building it with pygame.Surface(size, flags, surf)
+                # looks equivalent but is NOT: with SRCALPHA set at 32bpp pygame
+                # ignores the source masks and hands back its own channel order,
+                # which swaps red and blue.
+                self._scaled_dest = pygame.transform.smoothscale(
+                    surf, self._gif_display_size)
+            else:
+                try:
+                    pygame.transform.smoothscale(surf, self._gif_display_size,
+                                                 self._scaled_dest)
+                except (ValueError, pygame.error):
+                    # Destination no longer compatible — allocate a fresh one.
+                    self._scaled_dest = pygame.transform.smoothscale(
+                        surf, self._gif_display_size)
+            surf = self._scaled_dest
+        self._last_displayed_frame = index
+        return surf
+
+    def _update_gif_duration_estimate(self):
+        """Keep gif_total_duration reasonable while a GIF is still decoding."""
+        if not self.current_job or not self.is_gif:
+            return
+        if self.current_job.done:
+            self.gif_total_duration = self.current_job.total_duration
+        elif self.gif_durations and self.current_job.total_frames:
+            avg = sum(self.gif_durations) / len(self.gif_durations)
+            self.gif_total_duration = int(avg * self.current_job.total_frames)
+        else:
+            # Frame count is unknown until the worker hits EOF.
+            self.gif_total_duration = float('inf')
+
+    def _log_job_done(self, job):
+        """Print decode timing for the current slide once it finishes."""
+        if job.done_ticks is None:
+            return
+        first_ms = (job.first_frame_ticks - job.start_ticks
+                    if job.first_frame_ticks else None)
+        total_ms = job.done_ticks - job.start_ticks
+        name = os.path.basename(job.path)
+        if job.is_gif:
+            print(f"{Fore.CYAN}Decoded GIF {name}: first frame {first_ms}ms, "
+                  f"full decode {total_ms}ms ({job.total_frames} frames)"
+                  f"{Style.RESET_ALL}")
+        else:
+            print(f"{Fore.CYAN}Decoded {name}: {total_ms}ms{Style.RESET_ALL}")
+
+    def _drain_jobs(self):
+        """Pull decoded frames from the worker threads into pygame surfaces."""
+        # Current job: time-boxed drain so the main thread never starves the
+        # decoder with big frombytes() copies, while still staying ahead of
+        # real-time playback.  The budget is larger while the slide has barely
+        # any frames, so the opening frames land together instead of trickling.
+        if self.current_job:
+            had_any = bool(self.current_job.surfaces)
+            budget = (_STARTUP_DRAIN_MS
+                      if len(self.current_job.surfaces) < _STARTUP_FRAMES
+                      else _CURRENT_DRAIN_MS)
+            self.current_job.drain(float('inf'), budget)
+            if not had_any and self.current_job.surfaces:
+                # First frame just arrived — switch to it.
+                self._activate_job(self.current_job)
+            elif self.is_gif and self.current_job.surfaces:
+                self._update_gif_duration_estimate()
+
+            if self.current_job.done and not getattr(self.current_job, '_logged', False):
+                self.current_job._logged = True
+                self._log_job_done(self.current_job)
+
+            if self.current_job.error and not self.current_job.surfaces:
+                print(f"Error loading image {self.current_job.path}: "
+                      f"{self.current_job.error}")
+                self.current_image = None
+                self.is_gif = False
+                self.gif_loop_done = True
+                self.current_job = None
+
+        # Prefetch: lower priority, time-boxed even more.
+        if self.prefetch_job:
+            self.prefetch_job.drain(float('inf'), _PREFETCH_DRAIN_MS)
+            if self.prefetch_job.error:
+                self.prefetch_job.cancel()
+                self.prefetch_job = None
+
+        # Don't start prefetching the next slide until the current one is fully
+        # decoded (or errored).  This keeps the current GIF decoder from losing
+        # the GIL to a second worker during the critical first-loop playback.
+        if ((self.current_job is None or self.current_job.done)
+                and self.prefetch_job is None):
+            self._start_prefetch()
+
     def load_current_image(self):
         if not self.image_paths:
             return
-            
+
         path = self.image_paths[self.current_index]
-        # Replace backslashes with forward slashes to avoid Yen symbol rendering in CJK fonts
+        # Replace backslashes with forward slashes to avoid Yen symbol rendering
+        # in CJK fonts.
         display_path = path.replace('\\', '/')
-        self.caption_text = f"Slide {self.current_index + 1}/{len(self.image_paths)} - {display_path}"
+        self.caption_text = (f"Slide {self.current_index + 1}/"
+                             f"{len(self.image_paths)} - {display_path}")
         pygame.display.set_caption(self.caption_text)
-        
+
+        self._cancel_jobs()
+
+        # Reset playback state.  The old image stays on screen until the new
+        # one has decoded its first frame.
+        self.is_gif = False
+        self.scaled_gif_frames = []
+        self.gif_durations = []
+        self.current_gif_frame = 0
+        self.gif_total_duration = 0
+        self.gif_loop_done = True
+        self._gif_display_size = None
+        self._last_displayed_frame = None
+        self._scaled_dest = None
+
+        # Header read only — see the note in _start_prefetch about n_frames.
         try:
-            with Image.open(path) as self.pil_image:
-                self.is_gif = getattr(self.pil_image, "is_animated", False)
-                
-                if self.is_gif:
-                    self._show_load_spinner = (
-                        self.pil_image.n_frames > 30
-                        or os.path.getsize(path) > 5 * 1024 * 1024
-                    )
-                    self.gif_frames = []
-                    self.gif_durations = []
-                    self.current_gif_frame = 0
-                    
-                    for i in range(self.pil_image.n_frames):
-                        self.pil_image.seek(i)
-                        # copy() freezes the frame before the next seek()
-                        frame = self.pil_image.copy().convert('RGBA')
-                        self.gif_frames.append(frame)
-                        self.gif_durations.append(self.pil_image.info.get('duration', 100))
-                        if self._show_load_spinner:
-                            self._draw_loading_overlay()
-                    
-                    self.gif_total_duration = sum(self.gif_durations)
-                    self.gif_loop_done = False
-                else:
-                    self._show_load_spinner = False
-                    self.original_image = self.pil_image.convert('RGBA')
-                    self.gif_total_duration = 0
-                    self.gif_loop_done = True
-                    
-                self.rescale_image()
-                
+            with Image.open(path) as im:
+                is_gif = getattr(im, "is_animated", False)
+                native_size = im.size
+                display_size = self._compute_target_size(native_size)
         except Exception as e:
             print(f"Error loading image {path}: {e}")
             self.current_image = None
-            self.is_gif = False
-            self.gif_total_duration = 0
-            self.gif_loop_done = True
-            self._show_load_spinner = False
+            return
+
+        # img_x/img_y are deliberately NOT updated here.  The previous image is
+        # still on screen until this job's first frame arrives, so moving the
+        # offsets now would yank it to the incoming image's centring - a visible
+        # jump whenever the two have different aspect ratios.  _activate_job
+        # sets them at the moment the new frame is actually swapped in.
+
+        if is_gif:
+            self.is_gif = True
+            self.gif_loop_done = False
+            self.gif_total_duration = float('inf')
+
+        # Statics go through the same background job as GIFs.  Decoding a 20MB+
+        # photo inline used to block the event loop for ~1s, so the window
+        # froze and the click that triggered it wasn't processed until after -
+        # which read as "the button didn't work".
+        self.current_job = MediaLoadJob(path, native_size, display_size,
+                                        is_gif, pygame.time.get_ticks())
+        # Prefetch is intentionally NOT started here; _drain_jobs starts it once
+        # the current slide has finished decoding, so the two decoders don't
+        # fight over the GIL while the user is waiting on this one.
 
         now = pygame.time.get_ticks()
         self.last_switch_time = now
         self.last_gif_update = now
 
-    @staticmethod
-    def _pil_to_surface(pil_img, size):
-        scaled = pil_img.resize(size, Image.Resampling.LANCZOS)
-        return pygame.image.frombytes(scaled.tobytes(), scaled.size, scaled.mode)
-
-    def rescale_image(self):
-        if self.pil_image is None:
-            return
-
-        if self.is_gif and self.gif_frames:
-            img_w, img_h = self.gif_frames[0].size
-        elif self.original_image is not None:
-            img_w, img_h = self.original_image.size
-        else:
-            return
-        
-        win_w = self.display_surface.get_width()
-        win_h = self.display_surface.get_height()
-        
-        ratio = min(win_w/img_w, win_h/img_h)
-        new_w = int(img_w * ratio)
-        new_h = int(img_h * ratio)
-        
-        if new_w > 0 and new_h > 0:
-            self.img_x = (win_w - new_w) // 2
-            self.img_y = (win_h - new_h) // 2
-            
-            if self.is_gif:
-                self.scaled_gif_frames = []
-                for frame in self.gif_frames:
-                    self.scaled_gif_frames.append(
-                        self._pil_to_surface(frame, (new_w, new_h))
-                    )
-                    if self._show_load_spinner:
-                        self._draw_loading_overlay()
-                
-                if self.scaled_gif_frames:
-                    self.current_image = self.scaled_gif_frames[0]
-            else:
-                self.current_image = self._pil_to_surface(self.original_image, (new_w, new_h))
-
     def next_image(self):
-        if not self.image_paths: return
-        self.current_index = (self.current_index + 1) % len(self.image_paths)
-        self.load_current_image()
+        if not self.image_paths:
+            return
+        nxt = (self.current_index + 1) % len(self.image_paths)
+
+        # If we already prefetched the next slide and have at least one frame,
+        # promote that job instead of starting decode from scratch.
+        if (self.prefetch_job
+                and self.prefetch_job.surfaces
+                and os.path.normcase(os.path.abspath(self.prefetch_job.path))
+                == os.path.normcase(os.path.abspath(self.image_paths[nxt]))):
+            self.current_index = nxt
+            if self.current_job:
+                self.current_job.cancel()
+            self.current_job = self.prefetch_job
+            self.prefetch_job = None
+            self._activate_job(self.current_job)
+            # Prefetch for the new current slide will be started by _drain_jobs
+            # once this job finishes decoding.
+            path = self.image_paths[self.current_index]
+            display_path = path.replace('\\', '/')
+            self.caption_text = (f"Slide {self.current_index + 1}/"
+                                 f"{len(self.image_paths)} - {display_path}")
+            pygame.display.set_caption(self.caption_text)
+        else:
+            self.current_index = nxt
+            self.load_current_image()
 
     def prev_image(self):
-        if not self.image_paths: return
+        if not self.image_paths:
+            return
         self.current_index = (self.current_index - 1) % len(self.image_paths)
         self.load_current_image()
 
@@ -632,41 +1006,75 @@ class InstantSlideshow:
         self._draw_header()
         pygame.display.flip()
 
-    def _draw_loading_overlay(self):
+    def _draw_pending_loader(self):
+        """Prominent loader while the next slide's first frame is still decoding.
+
+        Drawn over whatever is still on screen, before the header, so the
+        controls stay crisp and clickable.
+        """
         if not self.display_surface:
             return
         w, h = self.display_surface.get_size()
-        self.display_surface.fill((0, 0, 0))
-        if self.current_image:
-            rect = self.current_image.get_rect(center=(w // 2, h // 2))
-            self.display_surface.blit(self.current_image, rect)
-        overlay = pygame.Surface((w, h), pygame.SRCALPHA)
-        overlay.fill((0, 0, 0, 140))
-        self.display_surface.blit(overlay, (0, 0))
+        if self._dim_overlay is None or self._dim_overlay.get_size() != (w, h):
+            self._dim_overlay = pygame.Surface((w, h), pygame.SRCALPHA)
+            self._dim_overlay.fill((0, 0, 0, 120))
+        self.display_surface.blit(self._dim_overlay, (0, 0))
 
         cx, cy = w // 2, h // 2
-        r = 24
+        r = 22
+        sweep = math.radians(90)
+        start = math.radians((pygame.time.get_ticks() / 3) % 360)
+        pygame.draw.circle(self.display_surface, (70, 70, 80), (cx, cy), r, 3)
+        pygame.draw.arc(self.display_surface, (255, 255, 255),
+                        (cx - r, cy - r, r * 2, r * 2),
+                        start, start + sweep, 4)
+        font = self.font_local if self.font_local else self.font_cjk
+        try:
+            txt = font.render("Loading...", True, (220, 220, 220))
+            self.display_surface.blit(
+                txt, txt.get_rect(center=(cx, cy + r + 20)))
+        except Exception:
+            pass
+
+    def _draw_decode_spinner(self):
+        """Small non-blocking spinner shown while a GIF is still decoding."""
+        if not self.display_surface:
+            return
+        w, h = self.display_surface.get_size()
+        cx, cy = w - 24, h - 24
+        r = 10
         sweep = math.radians(90)
         start = math.radians((pygame.time.get_ticks() / 3) % 360)
         pygame.draw.arc(self.display_surface, (255, 255, 255),
                         (cx - r, cy - r, r * 2, r * 2),
-                        start, start + sweep, 4)
-        self._draw_header()
-        pygame.event.pump()
-        pygame.display.flip()
+                        start, start + sweep, 3)
 
     def _draw_header(self):
         mouse_pos = pygame.mouse.get_pos()
 
-        header_surf = pygame.Surface((self.display_surface.get_width(), self.header_h), pygame.SRCALPHA)
-        header_surf.fill((0, 0, 0, 180))
-        self.display_surface.blit(header_surf, (0, 0))
+        width = self.display_surface.get_width()
+        if (self._header_bg is None
+                or self._header_bg.get_width() != width):
+            self._header_bg = pygame.Surface((width, self.header_h),
+                                             pygame.SRCALPHA)
+            self._header_bg.fill((0, 0, 0, 180))
+        self.display_surface.blit(self._header_bg, (0, 0))
 
         if self.caption_text:
             display_text = self.caption_text
             if self.paused:
                 display_text += " [PAUSED]"
-            self.draw_text_mixed(self.display_surface, display_text, (15, 15), (0, 255, 0))
+            cache_key = (display_text, self.display_surface.get_width())
+            if cache_key != self._caption_cache_key:
+                self._caption_cache_surf = pygame.Surface(
+                    (self.display_surface.get_width() - 30,
+                     self.header_h - 10),
+                    pygame.SRCALPHA)
+                self.draw_text_mixed(self._caption_cache_surf, display_text,
+                                     (0, 0), (0, 255, 0))
+                self._caption_cache_key = cache_key
+            if self._caption_cache_surf:
+                self.display_surface.blit(self._caption_cache_surf, (15, 15))
 
         close_color = (255, 80, 80) if self.close_hit_rect.collidepoint(mouse_pos) else (180, 180, 180)
         draw_close_x(self.display_surface, self.close_rect, close_color)
@@ -754,6 +1162,10 @@ class InstantSlideshow:
             return
         path = self.image_paths[idx]
 
+        # Stop decode workers so a huge GIF doesn't keep eating CPU/RAM while
+        # the delete dialog is busy.
+        self._cancel_jobs()
+
         self._draw_busy_overlay("Deleting...")
 
         try:
@@ -819,24 +1231,60 @@ class InstantSlideshow:
         while self.running:
             current_time = pygame.time.get_ticks()
 
+            # Pull frames from the background decode threads into pygame
+            # surfaces.  Current job is drained fully; prefetch is throttled.
+            self._drain_jobs()
+
             # Freeze auto-advance while a UI button is held so the release
             # acts on the image the user was looking at when they pressed.
             gif_pending = (self.is_gif
                            and self.gif_total_duration > self.slide_duration
                            and not self.gif_loop_done)
+            # Don't let the timer advance past a slide the user never saw - a
+            # slow photo would otherwise be skipped while still decoding.
+            still_loading = bool(self.current_job
+                                 and not self.current_job.surfaces
+                                 and not self.current_job.error)
             if (not self.paused
                     and self.pressed_control is None
                     and current_time - self.last_switch_time > self.slide_duration
-                    and not gif_pending):
+                    and not gif_pending
+                    and not still_loading):
                 self.next_image()
 
             if self.is_gif and self.scaled_gif_frames:
-                if current_time - self.last_gif_update > self.gif_durations[self.current_gif_frame]:
-                    self.current_gif_frame = (self.current_gif_frame + 1) % len(self.scaled_gif_frames)
-                    self.current_image = self.scaled_gif_frames[self.current_gif_frame]
+                job = self.current_job
+                # Start animating as soon as a couple of frames exist; playback
+                # then chases the decoder rather than waiting on a buffer.
+                if (len(self.scaled_gif_frames) >= _GIF_START_FRAMES
+                        or (job and job.done)):
+                    while (current_time - self.last_gif_update
+                           > self.gif_durations[self.current_gif_frame]):
+                        frame_duration = self.gif_durations[self.current_gif_frame]
+                        next_frame = self.current_gif_frame + 1
+
+                        if next_frame >= len(self.scaled_gif_frames):
+                            # Only wrap to frame 0 once the whole GIF is
+                            # decoded.  Until then, slide the clock forward and
+                            # wait for the decoder so playback stays smooth.
+                            if not job or job.done:
+                                next_frame = 0
+                                self.gif_loop_done = True
+                            else:
+                                self.last_gif_update = current_time
+                                break
+
+                        self.current_gif_frame = next_frame
+                        self.last_gif_update += frame_duration
+
+                    # Scale only the final frame we landed on this tick,
+                    # and only if its index actually changed.
+                    self.current_image = self._gif_display_surface(
+                        self.current_gif_frame)
+                else:
+                    # Only one frame so far — hold it, but don't let the clock
+                    # drift or we'll fast-forward the moment frame 2 lands.
                     self.last_gif_update = current_time
-                    if self.current_gif_frame == 0:
-                        self.gif_loop_done = True
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -933,16 +1381,35 @@ class InstantSlideshow:
 
             self.display_surface.fill((0, 0, 0))
 
+            job = self.current_job
+            awaiting_first = bool(job and not job.surfaces and not job.error)
+
             if self.current_image:
                 self.display_surface.blit(self.current_image, (self.img_x, self.img_y))
-            else:
+            elif not awaiting_first:
                 err_surf = self.font_cjk.render("Could not load image", True, (255, 255, 255))
                 self.display_surface.blit(err_surf, err_surf.get_rect(center=(self.width // 2, self.height // 2)))
 
+            # Any slow media - photo or GIF - gets the centred loader once it
+            # has been decoding longer than the flicker threshold.
+            show_loader = (awaiting_first
+                           and pygame.time.get_ticks() - job.start_ticks
+                           >= _LOADER_DELAY_MS)
+            if show_loader:
+                self._draw_pending_loader()
+
             self._draw_header()
 
+            # Subtle corner spinner for a GIF that's playing but still decoding.
+            if not show_loader and job and not job.done:
+                self._draw_decode_spinner()
+
             pygame.display.flip()
-            self.clock.tick(30)
+            # 30fps quantises GIF frame changes to 33ms, which judders common
+            # 40/50/60ms timings.  Run at 60 while a GIF is animating or the
+            # loader is spinning; idle static slides don't need it.
+            busy = (self.is_gif and self.scaled_gif_frames) or show_loader
+            self.clock.tick(60 if busy else 30)
 
         self._save_session_state()
 
