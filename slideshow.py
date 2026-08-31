@@ -24,6 +24,15 @@ except AttributeError:
     _BILINEAR = getattr(Image, 'BILINEAR', Image.LINEAR)
 
 
+def _cap_pixels(size, max_pixels):
+    """Shrink `size` proportionally until it covers at most max_pixels."""
+    w, h = size
+    if w * h <= max_pixels:
+        return size
+    scale = math.sqrt(max_pixels / float(w * h))
+    return (max(1, int(w * scale)), max(1, int(h * scale)))
+
+
 def _is_opaque(rgba_frame):
     """True when every pixel of an RGBA frame is fully opaque.
 
@@ -65,6 +74,30 @@ _GIF_START_FRAMES = 2
 # is per job, and the current slide's frames are still held while the next
 # prefetches, so the process peak is up to twice this.
 _GIF_MEMORY_BUDGET = 384 * 1024 * 1024
+
+# How thin an animation's buffer is allowed to get before frames are stored
+# smaller instead.  The budget above is a byte budget, so on its own the depth
+# of the buffer follows the monitor: the same 200 frame GIF keeps every frame
+# on a 1080p window (~5MB a frame) and is thinned to 18 on a 4K one (~21MB a
+# frame) - the file animates smoothly on one machine and stutters on another.
+# An animation that would not fit at window size is stored at
+# _GIF_MAX_FRAME_PIXELS instead, which holds this many frames on any display.
+# The cost is one smoothscale per displayed frame, the path upscaled GIFs
+# already take, so it is only paid by animations that would be thinned
+# otherwise.
+_GIF_MIN_BUFFERED_FRAMES = 48
+_GIF_MAX_FRAME_PIXELS = _GIF_MEMORY_BUDGET // (_GIF_MIN_BUFFERED_FRAMES * 4)
+
+# How much evidence an unverified frame count needs before the decoder thins
+# by another factor of two: this many source frames must have actually been
+# read for every frame it is keeping.  APNG takes its frame count from the
+# acTL header and WebP from the ANIM chunk, neither checked against the
+# stream, so a truncated file over-reports - and a keep rate above the real
+# frame count means no group ever completes and the animation collapses to
+# one held frame.  Ramping up to the claimed rate instead of trusting it
+# keeps at least this many frames of any animation, whatever its header says.
+# GIF needs none of this: Pillow counts GIF frames by seeking to EOF.
+_GIF_TRUST_SPAN = 16
 
 # Raw frames waiting to become pygame surfaces.  Unbounded, a worker races
 # ahead of the main thread and holds a second full copy of the animation as raw
@@ -346,15 +379,14 @@ class MediaLoadJob:
         # (The old condition was `is_gif and display < native`, which silently
         # sent every static down the native-size branch and blitted it
         # unresized at the display-size offset: a zoomed top-left crop.)
+        # An animation may shrink this again once the worker knows how many
+        # frames it has to hold at once - see _decode_gif.
         if is_gif and display_size[0] >= native_size[0]:
-            self.worker_size = native_size
+            self._set_worker_size(native_size)
         else:
-            self.worker_size = display_size
-        self.worker_w, self.worker_h = self.worker_size
-        self.needs_display_scale = (self.worker_size != display_size)
+            self._set_worker_size(display_size)
 
         # Bounded queue - see _DECODE_QUEUE_BYTES for why.
-        self.frame_bytes = max(1, self.worker_w * self.worker_h * 4)
         self.cancel_event = threading.Event()
         self.queue = queue.Queue(maxsize=max(
             _DECODE_QUEUE_MIN,
@@ -362,21 +394,40 @@ class MediaLoadJob:
         self.surfaces = []
         self.durations = []
 
-        # How much the buffer has been thinned since the main thread last
-        # looked, as a factor it can divide the displayed frame index by.
-        # Cumulative, so the main thread never needs to know what the decoder
-        # chose or how many times it chose it.
-        self.pending_shrink = 1
+        # How much the buffer has been thinned in total, as a factor.  Only
+        # _decimate writes it: a viewer divides its own frame index by however
+        # much it has grown since that viewer last looked, so nothing has to
+        # reach in and clear it, and a viewer that adopts the job later simply
+        # starts from the value it finds.
+        self.shrink_total = 1
         self._logged = False
 
         self.done = False
         self.error = None
         self.total_duration = 0
+        # Running length estimate while the decode is in flight, so the slide
+        # can be held for roughly the right time before EOF is reached.  The
+        # worker writes it and the main thread reads it: one float, so there is
+        # no half-updated state to see.
+        self.est_total_duration = None
         self.first_frame_ticks = None
         self.done_ticks = None
 
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
+
+    def _set_worker_size(self, size):
+        """Set the size decoded frames are stored at, and what follows from it.
+
+        The worker may call this again before it queues its first frame; the
+        main thread reads these only once a frame has arrived, so it never
+        sees the size change under it.  The queue keeps the depth it was built
+        with, which can only leave it more conservative.
+        """
+        self.worker_size = size
+        self.worker_w, self.worker_h = size
+        self.frame_bytes = max(1, self.worker_w * self.worker_h * 4)
+        self.needs_display_scale = (size != self.display_size)
 
     def _run(self):
         try:
@@ -437,7 +488,6 @@ class MediaLoadJob:
         the frames in between are added to the one that survives them, so
         playback keeps its real length and speed - it just gets choppier.
         """
-        max_buffered = max(2, _GIF_MEMORY_BUDGET // self.frame_bytes)
         total_duration = 0
         count = 0        # source frames read
         emitted = 0      # frames handed to the main thread
@@ -447,83 +497,133 @@ class MediaLoadJob:
         pending_duration = 0
         # The "delay under 20ms means unspecified" rule is a GIF centisecond
         # quirk; WebP and APNG store honest millisecond delays.
-        gif_delays = (im.format == 'GIF')
+        src_is_gif = (im.format == 'GIF')
+        gif_delays = src_is_gif
 
-        # Set the keep rate before decoding anything.  n_frames walks the frame
+        # Ask for the frame count first: it decides both how big the frames
+        # are stored and how many of them are kept.  n_frames walks the frame
         # headers without rastering them - measured 0.02-1.4ms across 6-frame
         # to 700-frame files, under a tenth of one decode - and this runs on
         # the worker, so the main-thread stall the rest of the code avoids
-        # n_frames for does not apply here.  Deciding up front is what keeps
-        # the first max_buffered frames from being decoded, shipped, converted
-        # to surfaces and then immediately thrown away by a decimation.
-        keep_every = 1
+        # n_frames for does not apply here.
         try:
             n_frames = im.n_frames
         except Exception:
             n_frames = 0
+
+        # Store the frames smaller only when the animation would not fit at
+        # window size anyway (see _GIF_MIN_BUFFERED_FRAMES); a short one keeps
+        # its full resolution and the blit path that needs no per-frame
+        # scaling.  An unknown or under-reported count just means no cap here
+        # and a thinner buffer, which the rate backstop below handles.
+        if n_frames * self.frame_bytes > _GIF_MEMORY_BUDGET:
+            self._set_worker_size(_cap_pixels(self.worker_size,
+                                              _GIF_MAX_FRAME_PIXELS))
+        max_buffered = max(2, _GIF_MEMORY_BUDGET // self.frame_bytes)
+
+        # Deciding the keep rate before decoding is what spares the dropped
+        # frames their convert/resize/tobytes, and spares the main thread the
+        # surfaces it would build and immediately throw away in a decimation.
+        # It does NOT spare the raster: im.load() below runs for every source
+        # frame either way, because a frame is only complete once the frames
+        # it is composited on top of have been decoded.
+        #
+        # How far the count is trusted depends on where Pillow got it.  For
+        # GIF it counts by seeking to EOF, so even a truncated file reports
+        # what is really there and the rate can be set from it at once.  APNG
+        # and WebP read it from a header field instead, so they start at 1 and
+        # ramp towards it as the frames turn up - see _GIF_TRUST_SPAN.
+        target_keep = 1
         if n_frames > max_buffered:
-            keep_every = -(-n_frames // max_buffered)   # ceil
+            target_keep = -(-n_frames // max_buffered)   # ceil
+        keep_every = target_keep if src_is_gif else 1
 
-        while True:
-            if self.cancel_event.is_set():
-                return
-            try:
-                im.seek(count)
-            except EOFError:
-                break
-
-            # Pillow's WebP seek() is lazy - it only records the requested
-            # frame index, and info['duration'] is refreshed by load().
-            # Reading the delay straight after seek() therefore yields the
-            # PREVIOUS frame's delay (and None for frame 0), and once frames
-            # start being skipped it yields the last loaded frame's delay.
-            # GIF and APNG fill info in during seek, so this is a no-op for
-            # them beyond the decode they already do on the next seek.
-            try:
-                im.load()
-            except Exception:
-                pass
-
-            duration = im.info.get('duration') or 0
-            if duration <= 0 or (gif_delays and duration < _GIF_MIN_FRAME_MS):
-                duration = _GIF_DEFAULT_FRAME_MS
-            total_duration += duration
-            count += 1
-
-            if group == 0:
-                # First source frame of a group is the one we keep.
-                frame = im.convert('RGBA')
-                if frame.size != self.worker_size:
-                    frame = frame.resize(self.worker_size, _BILINEAR)
-                pending_bytes = frame.tobytes()
-                # A frame with no alpha band and no transparency index can only
-                # convert to alpha=255 everywhere, and resizing a constant band
-                # leaves it constant - so the scan is skippable.  That is the
-                # common case for GIF, where it saves a full pass per frame.
-                pending_opaque = (('transparency' not in im.info
-                                   and 'A' not in im.getbands())
-                                  or _is_opaque(frame))
-                pending_duration = 0
-            pending_duration += duration
-            group += 1
-
-            if group >= keep_every:
-                if not self._put(('frame', pending_bytes, pending_duration,
-                                  pending_opaque)):
+        # A truncated or corrupt file raises out of the loop instead of
+        # signalling EOF - Pillow reports "Truncated File Read" - and the
+        # frames decoded before that point are still perfectly good.  So
+        # the error is held rather than thrown: the tail below still ships
+        # the pending group and a length, and _run reports the error after
+        # that.  Otherwise a file that goes bad on its last frame plays as
+        # a still with no duration at all.
+        err = None
+        try:
+            while True:
+                if self.cancel_event.is_set():
                     return
-                emitted += 1
-                group = 0
+                try:
+                    im.seek(count)
+                except EOFError:
+                    break
 
-                if emitted > max_buffered:
-                    # Backstop for a file whose n_frames was unavailable or
-                    # wrong: halve the rate from here and have the main thread
-                    # thin what it already holds by the same factor.  Strictly
-                    # greater, so an up-front rate that lands exactly on the
-                    # budget isn't halved again for being on target.
-                    keep_every *= 2
-                    emitted = (emitted + 1) // 2
-                    if not self._put(('decimate', 2)):
+                # Pillow's WebP seek() is lazy - it only records the
+                # requested frame index, and info['duration'] is refreshed
+                # by load().  Reading the delay straight after seek()
+                # therefore yields the PREVIOUS frame's delay (and None for
+                # frame 0), and once frames start being skipped it yields
+                # the last loaded frame's delay.  GIF and APNG fill info in
+                # during seek, so this is a no-op for them beyond the decode
+                # they already do on the next seek.
+                try:
+                    im.load()
+                except Exception:
+                    pass
+
+                duration = im.info.get('duration') or 0
+                if (duration <= 0
+                        or (gif_delays and duration < _GIF_MIN_FRAME_MS)):
+                    duration = _GIF_DEFAULT_FRAME_MS
+                total_duration += duration
+                count += 1
+                if n_frames > count:
+                    # Keep the main thread's slide-hold decision honest
+                    # before EOF (see _update_gif_duration_estimate).
+                    # Measured per SOURCE frame, so thinning the buffer
+                    # doesn't skew it; a header that over-reports only makes
+                    # the estimate long, and the hold has its own ceiling.
+                    self.est_total_duration = total_duration * n_frames / count
+
+                if group == 0:
+                    # First source frame of a group is the one we keep.
+                    frame = im.convert('RGBA')
+                    if frame.size != self.worker_size:
+                        frame = frame.resize(self.worker_size, _BILINEAR)
+                    pending_bytes = frame.tobytes()
+                    # A frame with no alpha band and no transparency index
+                    # can only convert to alpha=255 everywhere, and resizing
+                    # a constant band leaves it constant - so the scan is
+                    # skippable.  That is the common case for GIF, where it
+                    # saves a full pass per frame.
+                    pending_opaque = (('transparency' not in im.info
+                                       and 'A' not in im.getbands())
+                                      or _is_opaque(frame))
+                    pending_duration = 0
+                pending_duration += duration
+                group += 1
+
+                if group >= keep_every:
+                    if not self._put(('frame', pending_bytes, pending_duration,
+                                      pending_opaque)):
                         return
+                    emitted += 1
+                    group = 0
+
+                    if (emitted > max_buffered
+                            or (keep_every * 2 <= target_keep
+                                and count >= keep_every * _GIF_TRUST_SPAN)):
+                        # Halve the rate from here, and have the main thread
+                        # thin what it already holds by the same factor.
+                        # Either the buffer is full - the file has more frames
+                        # than its header promised, or promised nothing - or
+                        # enough source frames have now turned up to believe
+                        # the next step towards the rate the header asked for.
+                        # Strictly greater above, so a rate that lands exactly
+                        # on the budget isn't halved again for being on target.
+                        keep_every *= 2
+                        emitted = (emitted + 1) // 2
+                        if not self._put(('decimate', 2)):
+                            return
+        except Exception as e:
+            err = e
 
         if group:
             # Trailing partial group, so the last frames aren't dropped.
@@ -532,6 +632,8 @@ class MediaLoadJob:
                 return
 
         self._put(('done', count, total_duration))
+        if err is not None:
+            raise err
 
     def _decimate(self, factor):
         """Thin the buffered frames by `factor`, merging the dropped delays.
@@ -544,13 +646,18 @@ class MediaLoadJob:
         Mutates the lists in place: InstantSlideshow aliases them as
         scaled_gif_frames / gif_durations, so rebinding here would leave it
         pointing at the old buffer.
+
+        Only a factor below 2 returns early, and only because it is a no-op.
+        Anything that thins the buffer MUST fall through to shrink_total, or
+        the main thread keeps an index into a buffer that has moved under it.
+        Slicing already handles a buffer too short to thin.
         """
-        if factor < 2 or len(self.surfaces) < 2:
+        if factor < 2:
             return
         self.surfaces[:] = self.surfaces[::factor]
         self.durations[:] = [sum(self.durations[i:i + factor])
                              for i in range(0, len(self.durations), factor)]
-        self.pending_shrink *= factor
+        self.shrink_total *= factor
 
     def drain(self, max_frames, max_ms=None):
         """Convert queued raw frames into pygame surfaces.
@@ -882,26 +989,61 @@ class InstantSlideshow:
         return (os.path.normcase(os.path.abspath(a))
                 == os.path.normcase(os.path.abspath(b)))
 
-    def _cancel_jobs(self, wait_for_path=None):
-        """Cancel any in-flight loading jobs and detach them.
+    def _cancel_jobs(self):
+        """Cancel every in-flight loading job and detach it.
 
-        `wait_for_path` briefly joins the worker(s) decoding that file.  A
-        worker only notices the cancel flag at the top of its next frame, and
-        until it returns it is still inside `with Image.open(path)` - on
-        Windows that open handle makes send2trash fail with a sharing
-        violation, so the delete path waits for the thread to let go.  Only
-        the job holding that file is joined: joining the prefetch of some
-        unrelated image just adds another half second of frozen UI.
+        Returns without waiting: the workers notice the flag at the top of
+        their next frame and exit on their own.  The delete path, which needs
+        a file handle actually closed, uses _cancel_job_holding instead.
         """
-        jobs = [j for j in (self.current_job, self.prefetch_job) if j]
-        for job in jobs:
-            job.cancel()
-        if wait_for_path:
-            for job in jobs:
-                if self._same_file(job.path, wait_for_path):
-                    job.thread.join(timeout=0.5)
+        for job in (self.current_job, self.prefetch_job):
+            if job:
+                job.cancel()
         self.current_job = None
         self.prefetch_job = None
+
+    def _cancel_job_holding(self, path):
+        """Cancel and detach only the job that is decoding `path`, and join it.
+
+        A worker only notices the cancel flag at the top of its next frame,
+        and until it returns it is still inside `with Image.open(path)` - on
+        Windows that open handle makes send2trash fail with a sharing
+        violation, so the delete path waits for the thread to let go.  The
+        other job is left running on purpose, and joining it would be wrong
+        twice over: it does not hold the file, and after a delete it is
+        usually the prefetch of the slide that replaces the deleted one.
+        """
+        for attr in ('current_job', 'prefetch_job'):
+            job = getattr(self, attr)
+            if job and self._same_file(job.path, path):
+                job.cancel()
+                job.thread.join(timeout=0.5)
+                setattr(self, attr, None)
+
+    def _show_index(self, index):
+        """Make `index` the current slide.
+
+        Adopts the prefetch job when it already holds that file, which saves
+        decoding from scratch an image the background worker has frames for -
+        the ordinary case when advancing, and after a delete, where the slide
+        taking the deleted one's place is exactly the file being prefetched.
+        Otherwise the slide is decoded from scratch.
+        """
+        self.current_index = index
+        if not (self.prefetch_job
+                and self.prefetch_job.surfaces
+                and self._same_file(self.prefetch_job.path,
+                                    self.image_paths[index])):
+            self.load_current_image()
+            return
+        if self.current_job:
+            self.current_job.cancel()
+        self.current_job = self.prefetch_job
+        self.prefetch_job = None
+        self._activate_job(self.current_job)
+        # Prefetch for the new current slide will be started by _drain_jobs
+        # once this job finishes decoding.
+        self._set_caption()
 
     def _probe_media(self, path):
         """Read the header only: (is_animated, native_size, display_size).
@@ -932,7 +1074,10 @@ class InstantSlideshow:
         self.gif_loop_done = True
         self._gif_display_size = None
         self._last_displayed_frame = None
-        self._scaled_dest = None
+        self._scaled_dests = {}
+        # How much thinning of the current job's buffer is already reflected
+        # in current_gif_frame - see _drain_jobs.
+        self._shrink_seen = 1
 
     def _start_prefetch(self):
         """Begin decoding the next slide in the background."""
@@ -957,6 +1102,15 @@ class InstantSlideshow:
         win_w = self.display_surface.get_width()
         win_h = self.display_surface.get_height()
 
+        # _reset_playback_state owns the per-slide fields, index-keyed caches
+        # included; what the job defines is bound after it.  Thinning the job
+        # did before it was adopted is already baked into the buffer it hands
+        # over, so the cursor starts from where the job is now - a job
+        # decimated while it was still the prefetch must not have that factor
+        # applied again to an index that starts at 0.
+        self._reset_playback_state()
+        self._shrink_seen = job.shrink_total
+
         self.img_x = (win_w - job.display_w) // 2
         self.img_y = (win_h - job.display_h) // 2
         self.is_gif = job.is_gif
@@ -964,9 +1118,6 @@ class InstantSlideshow:
         self.gif_durations = job.durations
         self._gif_display_size = (job.display_size
                                   if job.needs_display_scale else None)
-        self._last_displayed_frame = None
-        self._scaled_dest = None
-        self.current_gif_frame = 0
         self.last_gif_update = now
         self.last_switch_time = now
 
@@ -984,7 +1135,7 @@ class InstantSlideshow:
         """Return the current GIF frame scaled to display size when needed.
 
         Caches the last scaled frame so we only scale once per displayed frame,
-        and reuses one destination surface so we aren't allocating a multi-MB
+        and reuses the destination surfaces so we aren't allocating a multi-MB
         surface every tick during playback.
         """
         if (index == self._last_displayed_frame
@@ -1001,39 +1152,49 @@ class InstantSlideshow:
             # writes the RGB through and leaves the alpha byte at 0, so every
             # opaque frame scaled into an SRCALPHA destination blits as fully
             # transparent, i.e. the animation goes black.
-            if (self._scaled_dest is None
-                    or self._scaled_dest.get_bitsize() != surf.get_bitsize()
-                    or self._scaled_dest.get_masks() != surf.get_masks()):
+            # One destination per format, not one overall: an animation whose
+            # frames alternate between opaque and transparent would otherwise
+            # miss the cache on every single frame and allocate a display-sized
+            # surface 60 times a second - the exact cost this reuse exists to
+            # avoid.  There are only ever two formats, so the dict stays tiny.
+            key = (surf.get_bitsize(), surf.get_masks())
+            dest = self._scaled_dests.get(key)
+            if dest is not None:
+                try:
+                    pygame.transform.smoothscale(surf, self._gif_display_size,
+                                                 dest)
+                except (ValueError, pygame.error):
+                    dest = None     # no longer compatible; mint a fresh one
+            if dest is None:
                 # Let smoothscale mint the destination on the first frame, then
                 # reuse it.  Building it with pygame.Surface(size, flags, surf)
                 # looks equivalent but is NOT: with SRCALPHA set at 32bpp pygame
                 # ignores the source masks and hands back its own channel order,
                 # which swaps red and blue.
-                self._scaled_dest = pygame.transform.smoothscale(
-                    surf, self._gif_display_size)
-            else:
-                try:
-                    pygame.transform.smoothscale(surf, self._gif_display_size,
-                                                 self._scaled_dest)
-                except (ValueError, pygame.error):
-                    # Destination no longer compatible — allocate a fresh one.
-                    self._scaled_dest = pygame.transform.smoothscale(
-                        surf, self._gif_display_size)
-            surf = self._scaled_dest
+                dest = pygame.transform.smoothscale(surf,
+                                                    self._gif_display_size)
+                self._scaled_dests[key] = dest
+            surf = dest
         self._last_displayed_frame = index
         return surf
 
     def _update_gif_duration_estimate(self):
-        """Keep gif_total_duration reasonable while a GIF is still decoding."""
+        """Keep gif_total_duration reasonable while a GIF is still decoding.
+
+        The running estimate comes from the worker, the only side that knows
+        how far through the source file it is; the exact total replaces it at
+        EOF, and a file whose header carries no frame count stays unknown for
+        the whole decode.
+        """
         if not self.current_job or not self.is_gif:
             return
         if self.current_job.done:
             self.gif_total_duration = self.current_job.total_duration
-        elif self.gif_durations and self.current_job.total_frames:
-            avg = sum(self.gif_durations) / len(self.gif_durations)
-            self.gif_total_duration = int(avg * self.current_job.total_frames)
+        elif self.current_job.est_total_duration:
+            self.gif_total_duration = int(self.current_job.est_total_duration)
         else:
-            # Frame count is unknown until the worker hits EOF.
+            # No frame count in the header, so the length stays unknown until
+            # the worker hits EOF.
             self.gif_total_duration = _GIF_DURATION_UNKNOWN
 
     def _gif_holds_slide(self, now):
@@ -1044,12 +1205,14 @@ class InstantSlideshow:
         decoding has no known length - gif_total_duration is
         _GIF_DURATION_UNKNOWN - so it gets the tighter ceiling, or it would
         hold the slide for the whole decode and then the whole animation.
-        Nothing is held past _GIF_MAX_HOLD_MS.
+        Nothing is held past _GIF_MAX_HOLD_MS, including when the slide
+        duration is longer than that: the ordinary slide timer governs from
+        there, and it has not elapsed yet.
         """
         if (not self.is_gif or self.gif_loop_done
                 or self.gif_total_duration <= self.slide_duration):
             return False
-        max_hold = max(self.slide_duration, _GIF_MAX_HOLD_MS)
+        max_hold = _GIF_MAX_HOLD_MS
         if self.gif_total_duration == _GIF_DURATION_UNKNOWN:
             max_hold = min(max_hold,
                            self.slide_duration * _GIF_MAX_HOLD_FACTOR)
@@ -1064,8 +1227,16 @@ class InstantSlideshow:
         total_ms = job.done_ticks - job.start_ticks
         name = os.path.basename(job.path)
         if job.is_gif:
+            # What was kept, not what was read: total_frames counts source
+            # frames (and is None when the decode errored out before EOF),
+            # so on its own it hides the one thing worth seeing here - that
+            # the animation was thinned to fit the memory budget.
+            kept = len(job.surfaces)
+            source = job.total_frames
+            frames = (f"{kept} of {source} frames" if source and source != kept
+                      else f"{kept} frames")
             print(f"{Fore.CYAN}Decoded GIF {name}: first frame {first_ms}ms, "
-                  f"full decode {total_ms}ms ({job.total_frames} frames)"
+                  f"full decode {total_ms}ms ({frames})"
                   f"{Style.RESET_ALL}")
         else:
             print(f"{Fore.CYAN}Decoded {name}: {total_ms}ms{Style.RESET_ALL}")
@@ -1083,15 +1254,15 @@ class InstantSlideshow:
                       else _CURRENT_DRAIN_MS)
             self.current_job.drain(float('inf'), budget)
 
-            shrink = self.current_job.pending_shrink
-            if shrink > 1:
-                self.current_job.pending_shrink = 1
-                if self.scaled_gif_frames is self.current_job.surfaces:
+            if self.scaled_gif_frames is self.current_job.surfaces:
+                shrink = self.current_job.shrink_total // self._shrink_seen
+                if shrink > 1:
                     # The decoder thinned the buffer under us.  Remap the frame
                     # we're showing and drop the scaled-frame cache, which is
                     # keyed by index.  The clamp is unreachable given the index
                     # is always in range before the divide, but an IndexError
                     # here would take the window down.
+                    self._shrink_seen = self.current_job.shrink_total
                     self.current_gif_frame = min(
                         self.current_gif_frame // shrink,
                         max(0, len(self.scaled_gif_frames) - 1))
@@ -1184,32 +1355,12 @@ class InstantSlideshow:
     def next_image(self):
         if not self.image_paths:
             return
-        nxt = (self.current_index + 1) % len(self.image_paths)
-
-        # If we already prefetched the next slide and have at least one frame,
-        # promote that job instead of starting decode from scratch.
-        if (self.prefetch_job
-                and self.prefetch_job.surfaces
-                and self._same_file(self.prefetch_job.path,
-                                    self.image_paths[nxt])):
-            self.current_index = nxt
-            if self.current_job:
-                self.current_job.cancel()
-            self.current_job = self.prefetch_job
-            self.prefetch_job = None
-            self._activate_job(self.current_job)
-            # Prefetch for the new current slide will be started by _drain_jobs
-            # once this job finishes decoding.
-            self._set_caption()
-        else:
-            self.current_index = nxt
-            self.load_current_image()
+        self._show_index((self.current_index + 1) % len(self.image_paths))
 
     def prev_image(self):
         if not self.image_paths:
             return
-        self.current_index = (self.current_index - 1) % len(self.image_paths)
-        self.load_current_image()
+        self._show_index((self.current_index - 1) % len(self.image_paths))
 
     def draw_text_mixed(self, surface, text, pos, color):
         x, y = pos
@@ -1506,10 +1657,13 @@ class InstantSlideshow:
         # the delete is a frozen window with no feedback at all.
         self._draw_busy_overlay("Deleting...")
 
-        # Stop the decode workers and release their frames: send2trash can
-        # block for a while, and on Windows it fails outright while a worker
-        # still has the file open, so this waits for the thread holding it.
-        self._cancel_jobs(wait_for_path=path)
+        # Stop the worker holding the file being deleted and release its
+        # frames: send2trash can block for a while, and on Windows it fails
+        # outright while a worker still has the file open, so this waits for
+        # that thread.  The other job is deliberately left alone - it is
+        # normally the prefetch of the slide that replaces this one, which
+        # _show_index below adopts instead of decoding it twice.
+        self._cancel_job_holding(path)
         self._reset_playback_state()
 
         try:
@@ -1538,10 +1692,12 @@ class InstantSlideshow:
             self.current_index -= 1
         if self.current_index >= len(self.image_paths):
             self.current_index = 0
-        # Always reload: the current slide's decode job was cancelled above, so
-        # even when some other image was the one deleted there is no live job
-        # left to finish it.
-        self.load_current_image()
+        # Deleting the current slide leaves current_index pointing at what was
+        # the next one - the file the prefetch has been decoding - so this
+        # usually adopts a slide that is already decoded.  Either way it has to
+        # go through _show_index: the cancelled job left no live decoder
+        # behind, and _reset_playback_state dropped its frames.
+        self._show_index(self.current_index)
 
     def get_sort_order(self):
         if self.sort_order_arg:
