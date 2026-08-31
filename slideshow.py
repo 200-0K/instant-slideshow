@@ -1,6 +1,7 @@
 import pygame
 import sys
 import os
+import shutil
 import json
 import random
 import ctypes
@@ -43,6 +44,11 @@ _GIF_START_FRAMES = 2
 # don't flash a spinner.
 _LOADER_DELAY_MS = 120
 
+# How often the resume position is checkpointed to disk while running, so a
+# crash or power loss costs at most this much progress.  Writes are skipped
+# when the position hasn't moved, so this is cheap on a paused slideshow.
+_CHECKPOINT_MS = 15000
+
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_FILE = os.path.join(SCRIPT_DIR, 'last_selected_list.txt')
 RECENTS_FILE = os.path.join(SCRIPT_DIR, 'recents.json')
@@ -71,38 +77,105 @@ def load_recents():
         except Exception:
             pass
 
+    # A process killed mid-write can leave the temp file behind.  It's never
+    # read (os.replace is what publishes a write), so just tidy it away.
+    tmp = f'{RECENTS_FILE}.tmp'
+    if os.path.exists(tmp):
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+
     if not os.path.exists(RECENTS_FILE):
+        # Main file missing but a backup survived (e.g. crash between the
+        # backup copy and the rename) - recover from it.
+        if os.path.exists(f'{RECENTS_FILE}.bak'):
+            try:
+                recovered = _read_recents_file(f'{RECENTS_FILE}.bak')
+                if recovered is not None:
+                    print(f"{Fore.YELLOW}Recovered recents from backup.")
+                    return recovered
+            except Exception:
+                pass
         return []
 
     try:
-        with open(RECENTS_FILE, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        if isinstance(data, list):
-            cleaned = []
-            for item in data:
-                if isinstance(item, dict) and 'path' in item:
-                    cleaned.append({
-                        'path': item['path'],
-                        'last_used': item.get('last_used', ''),
-                        'duration': int(item.get('duration', 30)),
-                        'sort': item.get('sort', 'random'),
-                        'seed': item.get('seed'),
-                        'last_image': item.get('last_image'),
-                        'last_index': item.get('last_index'),
-                        'total': item.get('total'),
-                    })
+        cleaned = _read_recents_file(RECENTS_FILE)
+        if cleaned is not None:
             return cleaned
+        print(f"{Fore.YELLOW}Warning: recents.json has unexpected contents.")
     except Exception as e:
         print(f"{Fore.YELLOW}Warning: could not read recents.json: {e}")
+
+    # Main file is corrupt or truncated - try the backup before giving up.
+    if os.path.exists(f'{RECENTS_FILE}.bak'):
+        try:
+            recovered = _read_recents_file(f'{RECENTS_FILE}.bak')
+            if recovered is not None:
+                print(f"{Fore.YELLOW}Recovered recents from backup.")
+                return recovered
+        except Exception as e:
+            print(f"{Fore.YELLOW}Warning: backup unreadable too: {e}")
     return []
 
 
 def save_recents(recents):
+    """Write recents.json atomically so a crash can't leave a truncated file.
+
+    Writes to a temp file in the same directory, flushes it all the way to
+    disk, keeps the previous good copy as a .bak, then renames into place.
+    os.replace is atomic on POSIX and on Windows, so a reader either sees the
+    whole old file or the whole new one - never a half-written one.
+    """
+    data = json.dumps(recents[:MAX_RECENTS], indent=2, ensure_ascii=False)
+    tmp = f'{RECENTS_FILE}.tmp'
     try:
-        with open(RECENTS_FILE, 'w', encoding='utf-8') as f:
-            json.dump(recents[:MAX_RECENTS], f, indent=2, ensure_ascii=False)
+        with open(tmp, 'w', encoding='utf-8') as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())   # survive power loss, not just process death
+
+        # Keep the last known-good file so a torn rename still leaves a copy.
+        if os.path.exists(RECENTS_FILE):
+            try:
+                shutil.copy2(RECENTS_FILE, f'{RECENTS_FILE}.bak')
+            except Exception:
+                pass
+
+        os.replace(tmp, RECENTS_FILE)
     except Exception as e:
         print(f"{Fore.YELLOW}Warning: could not save recents.json: {e}")
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except Exception:
+            pass
+
+
+def _read_recents_file(path):
+    """Parse one recents file, returning a cleaned list or None if unusable."""
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, list):
+        return None
+    cleaned = []
+    for item in data:
+        if isinstance(item, dict) and 'path' in item:
+            try:
+                duration = int(item.get('duration', 30))
+            except (TypeError, ValueError):
+                duration = 30
+            cleaned.append({
+                'path': item['path'],
+                'last_used': item.get('last_used', ''),
+                'duration': duration,
+                'sort': item.get('sort', 'random'),
+                'seed': item.get('seed'),
+                'last_image': item.get('last_image'),
+                'last_index': item.get('last_index'),
+                'total': item.get('total'),
+            })
+    return cleaned
 
 
 def draw_close_x(surface, rect, color, pad=6, width=2):
@@ -419,6 +492,8 @@ class InstantSlideshow:
         self._caption_cache_surf = None
         self._header_bg = None
         self._dim_overlay = None
+        self._last_saved_state = None
+        self._last_save_ticks = 0
 
         # Image / GIF playback state (updated from the active MediaLoadJob)
         self.is_gif = False
@@ -475,7 +550,14 @@ class InstantSlideshow:
 
         self.setup_window()
         self.load_current_image()
-        self.run()
+        try:
+            self.run()
+        finally:
+            # Even if the loop dies with an exception, don't lose the position.
+            try:
+                self._save_session_state()
+            except Exception as e:
+                print(f"{Fore.YELLOW}Warning: could not save session state: {e}")
 
     def get_slide_duration(self):
         if self.duration_arg is not None:
@@ -1217,15 +1299,38 @@ class InstantSlideshow:
             self.sort_order = 'random'
         print(f"{Fore.CYAN}Sort order set to {Style.BRIGHT}{self.sort_order}")
 
-    def _save_session_state(self):
+    def _save_session_state(self, force=True):
+        """Persist the resume position.
+
+        Called periodically as well as on exit, so a crash loses at most one
+        checkpoint interval instead of the whole session.  Skips the write when
+        nothing has changed, so idle slides don't touch the disk.
+        """
         if not hasattr(self, 'selected_file_path') or not self.image_paths:
             return
         last_image = None
         if 0 <= self.current_index < len(self.image_paths):
             last_image = self.image_paths[self.current_index]
+
+        state = (last_image, self.current_index, len(self.image_paths),
+                 self.slide_duration)
+        if not force and state == self._last_saved_state:
+            return
+
         save_session_state(self.selected_file_path, self.slide_duration / 1000,
                            self.sort_order, self.seed, last_image,
                            self.current_index, len(self.image_paths))
+        self._last_saved_state = state
+        self._last_save_ticks = pygame.time.get_ticks()
+
+    def _maybe_checkpoint(self, now):
+        """Save the resume position on an interval, if it moved."""
+        if now - self._last_save_ticks < _CHECKPOINT_MS:
+            return
+        # Reset the clock even when nothing changed, so an idle slideshow
+        # isn't re-checking every single tick.
+        self._last_save_ticks = now
+        self._save_session_state(force=False)
 
     def run(self):
         while self.running:
@@ -1234,6 +1339,10 @@ class InstantSlideshow:
             # Pull frames from the background decode threads into pygame
             # surfaces.  Current job is drained fully; prefetch is throttled.
             self._drain_jobs()
+
+            # Checkpoint the resume position periodically so a crash doesn't
+            # lose the whole session.
+            self._maybe_checkpoint(current_time)
 
             # Freeze auto-advance while a UI button is held so the release
             # acts on the image the user was looking at when they pressed.
@@ -1410,8 +1519,6 @@ class InstantSlideshow:
             # loader is spinning; idle static slides don't need it.
             busy = (self.is_gif and self.scaled_gif_frames) or show_loader
             self.clock.tick(60 if busy else 30)
-
-        self._save_session_state()
 
 def _format_ago(iso):
     '''Return a friendly relative-time string from an ISO-8601 timestamp.'''
