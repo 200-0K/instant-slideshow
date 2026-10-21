@@ -1,0 +1,809 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f0f13">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Instant Slideshow</title>
+<style>
+  :root {
+    --bg: #0f0f13;
+    --panel: #1b1b21;
+    --panel-2: #24242c;
+    --border: #2c2c35;
+    --text: #e6e6ec;
+    --dim: #9a9aa8;
+    --accent: #6ea8fe;
+    --accent-2: #9d7bff;
+    --danger: #ff6b6b;
+    --radius: 14px;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent;
+    -webkit-text-size-adjust: 100%;
+  }
+  body.viewer-open { overflow: hidden; }
+
+  /* ---------- List view ---------- */
+  .appbar {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: calc(env(safe-area-inset-top, 0px) + 12px) 16px 12px;
+    background: rgba(15, 15, 19, 0.85);
+    backdrop-filter: blur(10px);
+    -webkit-backdrop-filter: blur(10px);
+    border-bottom: 1px solid var(--border);
+  }
+  .appbar-title {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-weight: 650;
+    font-size: 17px;
+    letter-spacing: 0.2px;
+    flex: 1;
+    min-width: 0;
+  }
+  .dot {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2));
+    box-shadow: 0 0 10px rgba(110, 168, 254, 0.7);
+    flex: none;
+  }
+  main#listView {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 16px 16px calc(32px + env(safe-area-inset-bottom, 0px));
+  }
+  .status { color: var(--dim); font-size: 14px; text-align: center; padding: 28px 8px; margin: 0; }
+  .banner {
+    background: #3a1d22;
+    border: 1px solid #6b2a33;
+    color: #ffc2c2;
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-size: 14px;
+    line-height: 1.45;
+    margin: 0 0 14px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+  }
+  .recent-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 12px; }
+  .card {
+    display: block;
+    width: 100%;
+    text-align: left;
+    font: inherit;
+    color: inherit;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    padding: 15px 16px;
+    cursor: pointer;
+    transition: background 0.15s ease, transform 0.06s ease, border-color 0.15s ease;
+    overflow-wrap: anywhere;
+  }
+  .card:active { background: var(--panel-2); transform: scale(0.992); }
+  .card:disabled { opacity: 0.55; cursor: default; transform: none; }
+  .card-title { font-size: 15.5px; font-weight: 650; line-height: 1.3; }
+  .card-path {
+    color: var(--dim);
+    font-size: 12px;
+    margin-top: 3px;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+  }
+  .progress {
+    height: 5px;
+    border-radius: 99px;
+    background: #2a2a33;
+    overflow: hidden;
+    margin: 12px 0 8px;
+  }
+  .progress i {
+    display: block;
+    height: 100%;
+    width: 0;
+    border-radius: 99px;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+    transition: width 0.3s ease;
+  }
+  .card-meta { color: var(--dim); font-size: 12.5px; line-height: 1.45; }
+  .card-meta .warn { color: #ffb4b4; }
+
+  /* ---------- Buttons ---------- */
+  .icon-btn {
+    display: grid;
+    place-items: center;
+    width: 44px;
+    height: 44px;
+    flex: none;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 50%;
+    background: rgba(36, 36, 44, 0.72);
+    color: var(--text);
+    cursor: pointer;
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: transform 0.06s ease, background 0.15s ease;
+    padding: 0;
+  }
+  .icon-btn svg { width: 21px; height: 21px; }
+  .icon-btn.small { width: 40px; height: 40px; border-radius: 12px; background: transparent; border-color: transparent; }
+  .icon-btn.small svg { width: 19px; height: 19px; }
+  .icon-btn.big { width: 56px; height: 56px; }
+  .icon-btn.big svg { width: 25px; height: 25px; }
+  .icon-btn:active { transform: scale(0.92); background: rgba(60, 60, 74, 0.85); }
+  .icon-btn.danger { color: var(--danger); }
+  .icon-btn[disabled] { opacity: 0.4; cursor: default; }
+
+  /* ---------- Viewer ---------- */
+  #viewerView {
+    position: fixed;
+    inset: 0;
+    z-index: 20;
+    background: #07070a;
+    touch-action: pan-y;
+  }
+  #viewerView[hidden] { display: none; }
+  #viewerView.chrome-hidden { cursor: none; }
+  #slideImg {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: contain;
+    user-select: none;
+    -webkit-user-select: none;
+    -webkit-user-drag: none;
+  }
+  #slideImg.broken { visibility: hidden; }
+  .missing {
+    position: absolute;
+    inset: 0;
+    display: grid;
+    place-items: center;
+    align-content: center;
+    gap: 10px;
+    color: var(--dim);
+    text-align: center;
+    padding: 24px;
+    font-size: 14px;
+    line-height: 1.5;
+  }
+  .missing[hidden] { display: none; }
+  .missing .big { color: #ffb4b4; font-size: 16px; font-weight: 600; }
+  #timerTrack {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    background: rgba(255, 255, 255, 0.1);
+    z-index: 3;
+  }
+  #timerFill {
+    display: block;
+    height: 100%;
+    width: 0;
+    background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  }
+  #overlay {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    justify-content: space-between;
+    pointer-events: none;
+    transition: opacity 0.25s ease;
+  }
+  #overlay.hidden { opacity: 0; }
+  .bar {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: clamp(10px, 2.4vmin, 20px) clamp(12px, 3vmin, 26px);
+  }
+  .bar.top {
+    padding-top: calc(env(safe-area-inset-top, 0px) + clamp(10px, 2.4vmin, 20px));
+    background: linear-gradient(180deg, rgba(0, 0, 0, 0.72), transparent);
+  }
+  .bar.bottom {
+    justify-content: center;
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px) + clamp(12px, 3vmin, 24px));
+    background: linear-gradient(0deg, rgba(0, 0, 0, 0.72), transparent);
+  }
+  .bar .icon-btn { pointer-events: auto; }
+  #caption { flex: 1; min-width: 0; text-align: center; }
+  #captionName {
+    font-size: 14px;
+    font-weight: 600;
+    line-height: 1.3;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+    overflow-wrap: anywhere;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+  }
+  #captionCounter {
+    font-size: 12px;
+    color: rgba(230, 230, 236, 0.72);
+    margin-top: 2px;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.8);
+  }
+
+  /* ---------- Modal ---------- */
+  .modal {
+    position: absolute;
+    inset: 0;
+    z-index: 30;
+    display: grid;
+    place-items: center;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 24px;
+    pointer-events: auto;
+  }
+  .modal[hidden] { display: none; }
+  .modal-card {
+    width: min(360px, 100%);
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 18px;
+    box-shadow: 0 18px 50px rgba(0, 0, 0, 0.5);
+  }
+  .modal-title { font-size: 16px; font-weight: 650; margin-bottom: 8px; }
+  .modal-text { font-size: 13.5px; color: var(--dim); line-height: 1.5; overflow-wrap: anywhere; }
+  .modal-actions { display: flex; gap: 10px; margin-top: 18px; }
+  .btn {
+    flex: 1;
+    min-height: 44px;
+    border-radius: 12px;
+    border: 1px solid var(--border);
+    background: var(--panel-2);
+    color: var(--text);
+    font: inherit;
+    font-size: 14.5px;
+    font-weight: 600;
+    cursor: pointer;
+  }
+  .btn:active { transform: scale(0.98); }
+  .btn.danger { background: #4a1f26; border-color: #7a2f3a; color: #ffc2c2; }
+
+  /* ---------- Responsive / input-specific ---------- */
+  @media (hover: hover) {
+    .card:hover { background: var(--panel-2); border-color: #383844; }
+    .icon-btn:hover { background: rgba(60, 60, 74, 0.85); }
+  }
+  @media (min-width: 900px) {
+    main#listView { max-width: 1120px; }
+    .recent-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  }
+  @media (max-width: 380px) {
+    .appbar-title { font-size: 15.5px; }
+    .icon-btn.big { width: 50px; height: 50px; }
+    .bar { gap: 10px; }
+    #captionName { font-size: 13px; }
+  }
+  @media (orientation: landscape) and (max-height: 480px) {
+    .bar { padding-top: 8px; padding-bottom: 8px; }
+    .icon-btn.big { width: 46px; height: 46px; }
+    .icon-btn.big svg { width: 21px; height: 21px; }
+    #caption { text-align: left; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    * { transition: none !important; animation: none !important; }
+  }
+</style>
+</head>
+<body>
+
+<header class="appbar">
+  <div class="appbar-title"><span class="dot"></span>Instant Slideshow</div>
+  <button id="refreshBtn" class="icon-btn small" type="button" aria-label="Refresh list">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
+  </button>
+</header>
+
+<main id="listView">
+  <div id="banner" class="banner" hidden></div>
+  <p id="listStatus" class="status">Loading…</p>
+  <ul id="recentList" class="recent-list"></ul>
+</main>
+
+<section id="viewerView" hidden aria-label="Slideshow viewer">
+  <img id="slideImg" alt="" draggable="false">
+  <div id="missing" class="missing" hidden>
+    <div class="big">File missing on PC</div>
+    <div id="missingName"></div>
+  </div>
+  <div id="timerTrack"><i id="timerFill"></i></div>
+  <div id="overlay">
+    <div class="bar top">
+      <button id="backBtn" class="icon-btn" type="button" aria-label="Back to list">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>
+      </button>
+      <div id="caption">
+        <div id="captionName"></div>
+        <div id="captionCounter"></div>
+      </div>
+      <button id="delBtn" class="icon-btn danger" type="button" aria-label="Delete image">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+      </button>
+    </div>
+    <div class="bar bottom">
+      <button id="prevBtn" class="icon-btn big" type="button" aria-label="Previous image">
+        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="19 20 9 12 19 4 19 20"/><rect x="4" y="4" width="2.4" height="16" rx="1"/></svg>
+      </button>
+      <button id="playBtn" class="icon-btn big" type="button" aria-label="Pause"></button>
+      <button id="nextBtn" class="icon-btn big" type="button" aria-label="Next image">
+        <svg viewBox="0 0 24 24" fill="currentColor"><polygon points="5 4 15 12 5 20 5 4"/><rect x="17.6" y="4" width="2.4" height="16" rx="1"/></svg>
+      </button>
+    </div>
+  </div>
+  <div id="modal" class="modal" hidden>
+    <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+      <div id="modalTitle" class="modal-title">Delete this image?</div>
+      <div id="modalText" class="modal-text"></div>
+      <div class="modal-actions">
+        <button id="cancelDelBtn" class="btn" type="button">Cancel</button>
+        <button id="confirmDelBtn" class="btn danger" type="button">Delete</button>
+      </div>
+    </div>
+  </div>
+</section>
+
+<script>
+(() => {
+  'use strict';
+
+  const K = new URLSearchParams(location.search).get('k');
+  const withK = (url) => K ? url + (url.includes('?') ? '&' : '?') + 'k=' + encodeURIComponent(K) : url;
+  const $ = (id) => document.getElementById(id);
+
+  const els = {
+    banner: $('banner'), listStatus: $('listStatus'), recentList: $('recentList'),
+    refreshBtn: $('refreshBtn'),
+    viewer: $('viewerView'), slideImg: $('slideImg'), missing: $('missing'),
+    missingName: $('missingName'), timerFill: $('timerFill'), overlay: $('overlay'),
+    backBtn: $('backBtn'), delBtn: $('delBtn'), captionName: $('captionName'),
+    captionCounter: $('captionCounter'), prevBtn: $('prevBtn'), playBtn: $('playBtn'),
+    nextBtn: $('nextBtn'), modal: $('modal'), modalText: $('modalText'),
+    cancelDelBtn: $('cancelDelBtn'), confirmDelBtn: $('confirmDelBtn'),
+  };
+
+  const ICON_PLAY = '<svg viewBox="0 0 24 24" fill="currentColor"><polygon points="6 3 20 12 6 21 6 3"/></svg>';
+  const ICON_PAUSE = '<svg viewBox="0 0 24 24" fill="currentColor"><rect x="6" y="4" width="4" height="16" rx="1.2"/><rect x="14" y="4" width="4" height="16" rx="1.2"/></svg>';
+
+  const state = {
+    id: null, sort: null, total: 0, index: 0, version: '',
+    durationMs: 30000, playing: true, elapsed: 0, lastTick: 0,
+    names: new Map(),
+  };
+  const preloaded = new Set();
+  let viewerOpen = false;
+  let pushed = false;
+  let raf = null;
+  let hideTimer = 0;
+  let drag = null;
+  let lastWheel = 0;
+  let bannerTimer = 0;
+
+  // ---------- helpers ----------
+
+  function showBanner(message, sticky) {
+    els.banner.textContent = message;
+    els.banner.hidden = false;
+    clearTimeout(bannerTimer);
+    if (!sticky) bannerTimer = setTimeout(() => { els.banner.hidden = true; }, 8000);
+  }
+
+  els.banner.addEventListener('click', () => { els.banner.hidden = true; });
+
+  async function getJSON(url, options) {
+    const res = await fetch(withK(url), Object.assign({ cache: 'no-store' }, options));
+    let data = null;
+    try { data = await res.json(); } catch (e) { /* non-JSON error body */ }
+    if (!res.ok) throw new Error((data && data.error) || ('HTTP ' + res.status));
+    return data;
+  }
+
+  // ---------- recents list ----------
+
+  function renderRecents(items) {
+    els.recentList.textContent = '';
+    if (!items.length) {
+      els.listStatus.textContent = 'No recent slideshows yet. Run one on the PC first.';
+      return;
+    }
+    els.listStatus.textContent = '';
+    for (const item of items) {
+      const li = document.createElement('li');
+      const card = document.createElement('button');
+      card.type = 'button';
+      card.className = 'card';
+
+      const title = document.createElement('div');
+      title.className = 'card-title';
+      title.textContent = item.name;
+      card.appendChild(title);
+
+      const path = document.createElement('div');
+      path.className = 'card-path';
+      path.textContent = item.path;
+      card.appendChild(path);
+
+      const bar = document.createElement('div');
+      bar.className = 'progress';
+      const fill = document.createElement('i');
+      fill.style.width = (item.started ? Math.max(2, item.pct) : 0) + '%';
+      bar.appendChild(fill);
+      card.appendChild(bar);
+
+      const meta = document.createElement('div');
+      meta.className = 'card-meta';
+      if (item.exists) {
+        meta.textContent = item.meta || 'not started';
+      } else {
+        const warn = document.createElement('span');
+        warn.className = 'warn';
+        warn.textContent = 'List file not found on PC';
+        meta.appendChild(warn);
+        if (item.meta) meta.appendChild(document.createTextNode(' • ' + item.meta));
+        card.disabled = true;
+      }
+      card.appendChild(meta);
+
+      if (item.exists) {
+        card.addEventListener('click', () => openViewer(item));
+      }
+      li.appendChild(card);
+      els.recentList.appendChild(li);
+    }
+  }
+
+  async function loadRecents() {
+    try {
+      const data = await getJSON('/api/recents');
+      renderRecents(data.items || []);
+    } catch (e) {
+      els.listStatus.textContent = '';
+      showBanner('Could not load recents: ' + e.message, true);
+    }
+  }
+
+  els.refreshBtn.addEventListener('click', loadRecents);
+  setInterval(() => {
+    if (!viewerOpen && !document.hidden) loadRecents();
+  }, 20000);
+
+  // ---------- viewer ----------
+
+  function imageUrl(i) {
+    // The version keeps URLs unique per index mapping: without it a delete
+    // would leave the browser cache (and even a same-src assignment) serving
+    // the old slide for the shifted indices.
+    return withK('/api/image?id=' + encodeURIComponent(state.id) +
+                 '&sort=' + encodeURIComponent(state.sort) +
+                 '&v=' + encodeURIComponent(state.version) + '&i=' + i);
+  }
+
+  function preload(i) {
+    if (!state.total) return;
+    const n = ((i % state.total) + state.total) % state.total;
+    if (preloaded.has(n)) return;
+    preloaded.add(n);
+    const im = new Image();
+    im.src = imageUrl(n);
+  }
+
+  async function openViewer(item) {
+    try {
+      const data = await getJSON('/api/playlist?id=' + encodeURIComponent(item.id) +
+                                 '&sort=' + encodeURIComponent(item.sort));
+      if (!data.total) {
+        showBanner('This slideshow list is empty.');
+        return;
+      }
+      state.id = data.id;
+      state.sort = data.sort;
+      state.total = data.total;
+      state.version = data.version || '';
+      state.durationMs = Math.max(1000, (data.duration || 30) * 1000);
+      state.names.clear();
+      preloaded.clear();
+
+      viewerOpen = true;
+      els.viewer.hidden = false;
+      document.body.classList.add('viewer-open');
+      history.pushState({ viewer: true }, '');
+      pushed = true;
+
+      show(data.index, { reset: true, save: false });
+      state.lastTick = performance.now();
+      raf = requestAnimationFrame(tick);
+      setPlaying(true, true);
+      pokeOverlay();
+      els.viewer.focus();
+    } catch (e) {
+      showBanner('Could not open slideshow: ' + e.message, true);
+    }
+  }
+
+  function closeViewer() {
+    if (!viewerOpen) return;
+    const saved = flushSession(true);
+    viewerOpen = false;
+    if (raf) { cancelAnimationFrame(raf); raf = null; }
+    clearTimeout(hideTimer);
+    els.viewer.hidden = true;
+    els.slideImg.removeAttribute('src');
+    document.body.classList.remove('viewer-open');
+    // Refresh once the position has been written back, so the card's
+    // "stopped at" line is already up to date.
+    Promise.resolve(saved).then(loadRecents, loadRecents);
+  }
+
+  function show(i, opts) {
+    opts = opts || {};
+    if (!state.total) return;
+    state.index = ((i % state.total) + state.total) % state.total;
+    const cur = state.index;
+    if (opts.reset !== false) state.elapsed = 0;
+
+    els.missing.hidden = true;
+    els.slideImg.classList.remove('broken');
+    els.slideImg.src = imageUrl(cur);
+
+    els.captionCounter.textContent = (cur + 1) + ' / ' + state.total;
+    updateCaption(cur);
+    preload(cur + 1);
+    preload(cur - 1);
+    if (opts.save !== false) scheduleSessionSave();
+  }
+
+  async function updateCaption(i) {
+    els.captionName.textContent = '';
+    if (state.names.has(i)) {
+      els.captionName.textContent = state.names.get(i);
+      return;
+    }
+    try {
+      const data = await getJSON('/api/item?id=' + encodeURIComponent(state.id) +
+                                 '&sort=' + encodeURIComponent(state.sort) + '&i=' + i);
+      state.names.set(i, data.name);
+      if (viewerOpen && state.index === i) els.captionName.textContent = data.name;
+    } catch (e) { /* caption is optional */ }
+  }
+
+  els.slideImg.addEventListener('error', () => {
+    if (!els.slideImg.getAttribute('src')) return;
+    els.slideImg.classList.add('broken');
+    els.missingName.textContent = state.names.get(state.index) || '';
+    els.missing.hidden = false;
+    updateCaption(state.index).then(() => {
+      els.missingName.textContent = state.names.get(state.index) || '';
+    });
+  });
+
+  // -- timer --
+
+  function tick(now) {
+    if (!viewerOpen) return;
+    const dt = Math.min(1000, now - state.lastTick);
+    state.lastTick = now;
+    if (state.playing && state.total && els.modal.hidden) {
+      state.elapsed += dt;
+      if (state.elapsed >= state.durationMs) show(state.index + 1);
+    }
+    const pct = state.durationMs > 0 ? Math.min(1, state.elapsed / state.durationMs) : 0;
+    els.timerFill.style.width = (pct * 100).toFixed(2) + '%';
+    raf = requestAnimationFrame(tick);
+  }
+
+  function setPlaying(playing, quiet) {
+    state.playing = playing;
+    els.playBtn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+    els.playBtn.setAttribute('aria-label', playing ? 'Pause' : 'Play');
+    state.lastTick = performance.now();
+    if (!quiet) pokeOverlay();
+    if (!playing) {
+      clearTimeout(hideTimer);
+      els.overlay.classList.remove('hidden');
+      els.viewer.classList.remove('chrome-hidden');
+    }
+  }
+
+  function pokeOverlay() {
+    clearTimeout(hideTimer);
+    els.overlay.classList.remove('hidden');
+    els.viewer.classList.remove('chrome-hidden');
+    if (state.playing && viewerOpen) {
+      hideTimer = setTimeout(() => {
+        if (!els.modal.hidden) return;
+        els.overlay.classList.add('hidden');
+        els.viewer.classList.add('chrome-hidden');
+      }, 3500);
+    }
+  }
+
+  // -- controls --
+
+  els.prevBtn.addEventListener('click', () => { show(state.index - 1); pokeOverlay(); });
+  els.nextBtn.addEventListener('click', () => { show(state.index + 1); pokeOverlay(); });
+  els.playBtn.addEventListener('click', () => { setPlaying(!state.playing); });
+  els.backBtn.addEventListener('click', () => { if (pushed) history.back(); else closeViewer(); });
+  els.delBtn.addEventListener('click', () => openModal());
+  els.cancelDelBtn.addEventListener('click', () => closeModal());
+  els.confirmDelBtn.addEventListener('click', deleteCurrent);
+
+  function openModal() {
+    const name = state.names.get(state.index) || 'this image';
+    els.modalText.textContent = name + ' will be moved to the Recycle Bin on the PC.';
+    els.modal.hidden = false;
+    clearTimeout(hideTimer);
+    els.overlay.classList.remove('hidden');
+    els.viewer.classList.remove('chrome-hidden');
+    els.cancelDelBtn.focus();
+  }
+
+  function closeModal() {
+    els.modal.hidden = true;
+    els.delBtn.focus();
+    pokeOverlay();
+  }
+
+  async function deleteCurrent() {
+    const i = state.index;
+    closeModal();
+    try {
+      const data = await getJSON('/api/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ id: state.id, sort: state.sort, i }),
+      });
+      state.names.clear();
+      preloaded.clear();
+      if (!data.total) {
+        closeViewer();
+        showBanner('Playlist is empty now.');
+        return;
+      }
+      state.total = data.total;
+      state.version = data.version || state.version;
+      // The deleted slide had the same index as this one, so without this
+      // the dedup in flushSession would skip the write and recents.json
+      // would keep pointing at the file we just trashed.
+      lastSent = -1;
+      show(data.index, { reset: true });
+    } catch (e) {
+      showBanner('Delete failed: ' + e.message, true);
+    }
+  }
+
+  // -- gestures --
+
+  els.viewer.addEventListener('pointerdown', (e) => {
+    if (e.target.closest('button') || !els.modal.hidden) return;
+    drag = { x: e.clientX, y: e.clientY, t: performance.now() };
+  });
+
+  els.viewer.addEventListener('pointerup', (e) => {
+    const d = drag;
+    drag = null;
+    if (!d || e.target.closest('button') || !els.modal.hidden) return;
+    const dx = e.clientX - d.x;
+    const dy = e.clientY - d.y;
+    const dt = performance.now() - d.t;
+    const adx = Math.abs(dx);
+    const ady = Math.abs(dy);
+
+    // Horizontal swipe (or a quick flick) flips the slide.
+    if (adx > ady * 1.4 && (adx > 42 || (dt < 260 && adx > 24))) {
+      show(state.index + (dx < 0 ? 1 : -1));
+      pokeOverlay();
+      return;
+    }
+    // A tap toggles the controls; on an edge a tap navigates.
+    if (adx < 12 && ady < 12 && dt < 500) {
+      const overlayHidden = els.overlay.classList.contains('hidden');
+      if (overlayHidden) { pokeOverlay(); return; }
+      const w = els.viewer.clientWidth;
+      if (d.x < w * 0.22) show(state.index - 1);
+      else if (d.x > w * 0.78) show(state.index + 1);
+      else {
+        els.overlay.classList.add('hidden');
+        els.viewer.classList.add('chrome-hidden');
+        clearTimeout(hideTimer);
+        return;
+      }
+      pokeOverlay();
+    }
+  });
+
+  els.viewer.addEventListener('pointercancel', () => { drag = null; });
+
+  els.viewer.addEventListener('wheel', (e) => {
+    if (!els.modal.hidden) return;
+    e.preventDefault();
+    const now = performance.now();
+    if (now - lastWheel < 250) return;
+    const delta = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+    if (Math.abs(delta) < 8) return;
+    lastWheel = now;
+    show(state.index + (delta > 0 ? 1 : -1));
+    pokeOverlay();
+  }, { passive: false });
+
+  window.addEventListener('keydown', (e) => {
+    if (!viewerOpen) return;
+    if (!els.modal.hidden) {
+      if (e.key === 'Escape' || e.key === 'Enter') { e.preventDefault(); closeModal(); }
+      return;
+    }
+    if (e.key === 'ArrowRight') { e.preventDefault(); show(state.index + 1); pokeOverlay(); }
+    else if (e.key === 'ArrowLeft') { e.preventDefault(); show(state.index - 1); pokeOverlay(); }
+    else if (e.key === ' ' || e.key === 'Spacebar') { e.preventDefault(); setPlaying(!state.playing); }
+    else if (e.key === 'Escape') { e.preventDefault(); if (pushed) history.back(); else closeViewer(); }
+    else if (e.key === 'f' || e.key === 'F') {
+      if (document.fullscreenElement) document.exitFullscreen();
+      else els.viewer.requestFullscreen && els.viewer.requestFullscreen();
+    }
+  });
+
+  window.addEventListener('popstate', () => {
+    if (viewerOpen) { pushed = false; closeViewer(); }
+  });
+
+  // -- session sync --
+
+  let sessionTimer = 0;
+  let lastSent = -1;
+
+  function scheduleSessionSave() {
+    clearTimeout(sessionTimer);
+    sessionTimer = setTimeout(() => flushSession(false), 1200);
+  }
+
+  function flushSession(keepalive) {
+    clearTimeout(sessionTimer);
+    if (!state.id || !state.total || state.index === lastSent) return null;
+    lastSent = state.index;
+    return fetch(withK('/api/session'), {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ id: state.id, sort: state.sort, i: state.index }),
+      keepalive: !!keepalive,
+    }).catch(() => {});
+  }
+
+  window.addEventListener('pagehide', () => flushSession(true));
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushSession(true);
+  });
+
+  // ---------- boot ----------
+
+  loadRecents();
+})();
+</script>
+</body>
+</html>

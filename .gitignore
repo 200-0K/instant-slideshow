@@ -6,5 +6,7 @@ __pycache__/
 recents.json
 recents.json.bak
 last_selected_list.txt
+web_token.txt
 *.bat
+!run_web.bat
 bak

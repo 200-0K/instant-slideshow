@@ -74,6 +74,42 @@ Or open the picker: the **Recent** list shows each saved slideshow with its file
 | **Scroll Wheel** | Navigate Previous / Next (Adjust duration when hovering over timer) |
 | **Drag Top** | Move Window |
 
+## Web View (phone / LAN)
+
+Open the picker's recents from any device on your Wi-Fi, with the same
+ordering, duration and resume position as the desktop app.
+
+```bash
+python web_server.py
+```
+
+Or double-click `run_web.bat` (keeps the console open). The server prints a
+secret URL for each LAN address, e.g. `http://192.168.1.20:8765/?k=…`. Open it
+on your phone and bookmark it: the token is kept in `web_token.txt` so the
+bookmark survives restarts. Every data request needs that token; the page
+never serves files outside the slideshow lists.
+
+What it does:
+
+*   **Recents list:** the same entries, progress (`stopped at 42/1500 (3%)`),
+    duration, sort order and "time ago" as the desktop picker. Lists whose
+    file no longer exists are shown greyed out. The page refreshes itself.
+*   **Viewer:** tap a list to open it at the saved slide. Swipe left/right (or
+    tap the screen edges, arrow keys, scroll wheel) to navigate, pause with the
+    button or Space, auto-advance using the saved duration.
+*   **Delete:** the trash button moves the current image to the Recycle Bin,
+    exactly like the desktop trash button. The list file on disk is never
+    edited, so a deleted image only disappears from the current session.
+*   **Sync:** the position is written back to `recents.json`, so the desktop
+    app's Continue resumes where the phone stopped - and vice versa.
+*   GIFs and animated WebP/PNG play natively in the browser; TIFF/PCX/TGA are
+    converted to PNG on the fly. A GIF longer than the slide timer advances
+    with the timer (use pause to keep watching it).
+
+Options: `--port 8765`, `--host 0.0.0.0`, `--token <value>`,
+`--recents <path>`. For a different port, remember to open that port in
+Windows Firewall (the first launch usually asks).
+
 ## UI Buttons
 *   **Folder Icon:** Opens the file explorer to the current image's location.
 *   **Image Icon:** Opens the current image/media in the default system viewer.
